@@ -1,0 +1,44 @@
+{
+  "sound_categories": {
+    "alarm": {
+      "display_name": "경보음 / 사이렌",
+      "priority": 1,
+      "volume_multiplier": 1.0,
+      "description": "화재경보, 사이렌, 긴급 알림"
+    },
+    "speech": {
+      "display_name": "말소리 (음성)",
+      "priority": 2,
+      "volume_multiplier": 0.4,
+      "description": "사람의 말소리, 대화"
+    },
+    "music": {
+      "display_name": "음악",
+      "priority": 3,
+      "volume_multiplier": 0.2,
+      "description": "음악, 노래"
+    },
+    "keyboard": {
+      "display_name": "키보드 / 타이핑",
+      "priority": 4,
+      "volume_multiplier": 0.7,
+      "description": "키보드 타이핑, 마우스 클릭"
+    },
+    "environment": {
+      "display_name": "환경 소음",
+      "priority": 5,
+      "volume_multiplier": 0.8,
+      "description": "바람, 군중, 배경 소음"
+    }
+  },
+  "settings": {
+    "base_volume": 1.0,
+    "detection_threshold": 0.3,
+    "smoothing_window": 5,
+    "response_time_ms": 200,
+    "recovery_time_ms": 1500,
+    "sample_rate": 22050,
+    "chunk_duration_ms": 500,
+    "model_type": "yamnet"
+  }
+}
