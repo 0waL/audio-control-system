@@ -93,7 +93,7 @@ class PriorityManager:
     def _load(self):
         if self._path.exists():
             try:
-                with open(self._path) as f:
+                with open(self._path, encoding="utf-8") as f:
                     self._config = json.load(f)
                 logger.info(f"Loaded user config from {self._path}")
                 return
@@ -105,12 +105,12 @@ class PriorityManager:
 
     @staticmethod
     def _load_defaults() -> dict:
-        with open(DEFAULT_CONFIG_PATH) as f:
+        with open(DEFAULT_CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f)
 
     def _save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w") as f:
+        with open(self._path, "w", encoding="utf-8") as f:
             json.dump(self._config, f, ensure_ascii=False, indent=2)
         logger.debug(f"Config saved to {self._path}")
 
