@@ -1,7 +1,7 @@
 """
 Cross-platform system volume controller.
 
-Priority: PulseAudio (Linux) → ALSA amixer (Linux) → macOS osascript → stub.
+Priority: Windows (pycaw) → PulseAudio (Linux) → ALSA amixer (Linux) → macOS osascript → stub.
 
 Volume changes are smoothed with an exponential moving average to avoid
 jarring sudden jumps, and a recovery timer gradually restores the volume
@@ -26,6 +26,26 @@ class VolumeBackend:
 
     def set_volume(self, level: float):
         raise NotImplementedError
+
+
+class WindowsBackend(VolumeBackend):
+    """Windows volume control via pycaw (Core Audio API)."""
+
+    def __init__(self):
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        self._volume = cast(interface, POINTER(IAudioEndpointVolume))
+
+    def get_volume(self) -> float:
+        # GetMasterVolumeLevelScalar returns 0.0–1.0
+        return float(self._volume.GetMasterVolumeLevelScalar())
+
+    def set_volume(self, level: float):
+        level = max(0.0, min(1.0, level))
+        self._volume.SetMasterVolumeLevelScalar(level, None)
 
 
 class PulseAudioBackend(VolumeBackend):
@@ -117,19 +137,32 @@ class StubBackend(VolumeBackend):
 
 
 def _create_backend() -> VolumeBackend:
+    import platform
+    system = platform.system()
+
+    if system == "Windows":
+        try:
+            backend = WindowsBackend()
+            backend.get_volume()
+            logger.info("Using Windows (pycaw) backend")
+            return backend
+        except Exception as e:
+            logger.warning(f"Windows backend failed ({e}), using stub")
+            return StubBackend()
+
+    if system == "Darwin":
+        logger.info("Using macOS backend")
+        return MacOSBackend()
+
+    # Linux: try PulseAudio first, fall back to ALSA
     try:
         import pulsectl
         backend = PulseAudioBackend()
-        backend.get_volume()  # validate connection
+        backend.get_volume()
         logger.info("Using PulseAudio backend")
         return backend
     except Exception:
         pass
-
-    import platform
-    if platform.system() == "Darwin":
-        logger.info("Using macOS backend")
-        return MacOSBackend()
 
     try:
         ALSABackend().get_volume()
