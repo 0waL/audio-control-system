@@ -15,6 +15,7 @@ import argparse
 import logging
 import sys
 import signal
+import threading
 import time
 
 
@@ -122,7 +123,6 @@ def _run_cli(engine, pm):
         print("\n종료 중 ...")
         shutdown.set()
 
-    import threading
     signal.signal(signal.SIGINT, _sigint)
 
     try:
