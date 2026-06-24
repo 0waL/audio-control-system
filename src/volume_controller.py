@@ -36,8 +36,16 @@ class WindowsBackend(VolumeBackend):
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
         devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        self._volume = cast(interface, POINTER(IAudioEndpointVolume))
+        # Newer pycaw: GetSpeakers() returns an AudioDevice wrapper exposing
+        # the ready-made IAudioEndpointVolume via its .EndpointVolume property.
+        # Older pycaw: GetSpeakers() returns a raw IMMDevice with .Activate().
+        if hasattr(devices, "EndpointVolume"):
+            self._volume = devices.EndpointVolume
+        else:
+            interface = devices.Activate(
+                IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+            )
+            self._volume = cast(interface, POINTER(IAudioEndpointVolume))
 
     def get_volume(self) -> float:
         # GetMasterVolumeLevelScalar returns 0.0–1.0
