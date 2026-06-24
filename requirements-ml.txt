@@ -1,0 +1,13 @@
+# Deep-learning extras: YAMNet inference + CNN / transfer-learning training.
+#
+# REQUIRES Python 3.10–3.13 — TensorFlow has no wheels for Python 3.14 yet.
+# Install inside a dedicated virtual environment:
+#     py -3.12 -m venv .venv
+#     .venv\Scripts\activate        (Windows)   |   source .venv/bin/activate (Linux/macOS)
+#     pip install -r requirements-ml.txt
+#
+# This pulls in the core runtime too.
+-r requirements.txt
+
+tensorflow>=2.13,<2.22
+tensorflow-hub>=0.14.0

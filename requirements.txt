@@ -1,4 +1,5 @@
-# Core
+# Core runtime — works on any Python (incl. 3.14). Runs the real-time app with
+# the YAMNet classifier if TensorFlow is present, otherwise the MFCC fallback.
 numpy>=1.24.0
 scipy>=1.11.0
 librosa>=0.10.0
@@ -8,12 +9,15 @@ matplotlib>=3.7.0
 pydub>=0.25.1
 psutil>=5.9.0
 
-# Deep learning (optional — needed for YAMNet and CNN training)
-# tensorflow>=2.13.0
-# tensorflow-hub>=0.14.0
+# Platform-specific volume control (auto-selected by OS):
+#   Windows → pycaw / comtypes   (installed automatically via markers below)
+#   Linux   → `pip install pulsectl` (PulseAudio) or system `amixer` (ALSA)
+#   macOS   → built-in `osascript` (no extra package)
+pycaw>=20240210; sys_platform == 'win32'
+comtypes>=1.2.0; sys_platform == 'win32'
 
-# Platform-specific volume control — install only what matches your OS:
-#   Windows  → pip install pycaw comtypes
-#   Linux    → pip install pulsectl          (PulseAudio)
-#              (or use system amixer — no pip package needed)
-#   macOS    → no extra package needed (uses osascript)
+# Deep learning (YAMNet inference + CNN/transfer-learning training) is split
+# into requirements-ml.txt because TensorFlow has NO wheels for Python 3.14 yet.
+# Use a dedicated Python 3.10–3.13 venv:
+#     py -3.12 -m venv .venv && .venv\Scripts\activate
+#     pip install -r requirements-ml.txt
