@@ -37,7 +37,8 @@ class AudioControlEngine:
         overlap_ms: int = 100,
         mic_device: Optional[int] = None,
         mfcc_model_path: Optional[str] = None,
-        use_yamnet: bool = True,
+        cnn_model_path: Optional[str] = None,
+        use_cnn: bool = True,
     ):
         self._pm = priority_manager
         settings = priority_manager.get_settings()
@@ -46,7 +47,8 @@ class AudioControlEngine:
             smoothing_window=settings.get("smoothing_window", 5),
             detection_threshold=settings.get("detection_threshold", 0.3),
             mfcc_model_path=mfcc_model_path,
-            use_yamnet=use_yamnet,
+            cnn_model_path=cnn_model_path,
+            use_cnn=use_cnn,
         )
 
         self._volume_ctrl = VolumeController(

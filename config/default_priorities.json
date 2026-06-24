@@ -37,8 +37,8 @@
     "smoothing_window": 5,
     "response_time_ms": 200,
     "recovery_time_ms": 1500,
-    "sample_rate": 22050,
+    "sample_rate": 16000,
     "chunk_duration_ms": 500,
-    "model_type": "yamnet"
+    "model_type": "cnn"
   }
 }

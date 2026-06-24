@@ -13,6 +13,8 @@ venv/
 models/*.pkl
 models/*.keras
 models/*.h5
+models/*.pt
+models/*.pth
 .pytest_cache/
 *.log
 ~/.audio-control/

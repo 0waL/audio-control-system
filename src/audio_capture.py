@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 AudioCallback = Callable[[np.ndarray, int], None]
 
-# YAMNet requires 16 kHz; MFCC heuristic works at any rate.
+# 16 kHz is the project standard (CNN mel features); heuristic works at any rate.
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHUNK_MS = 500
 DEFAULT_OVERLAP_MS = 100

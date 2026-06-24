@@ -114,7 +114,7 @@ class TestAudioClassifier:
         self.clf = AudioClassifier(
             smoothing_window=1,
             detection_threshold=0.3,
-            use_yamnet=False,  # use heuristic in unit tests
+            use_cnn=False,  # use heuristic in unit tests
         )
 
     def test_classify_returns_dict(self):

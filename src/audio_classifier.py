@@ -1,57 +1,23 @@
 """
-Real-time audio classifier using YAMNet (transfer learning) and custom CNN.
+Real-time audio classifier.
 
-YAMNet is pre-trained on AudioSet (~521 classes). We map its output to our
-5 target categories via a learned classification head, then fall back to
-MFCC-based CNN when TensorFlow Hub is unavailable.
+Primary backend is a custom PyTorch CNN (`src.cnn_model.AudioCNN`) trained on
+log-mel spectrograms. When no trained model is available — or PyTorch isn't
+installed — the system falls back to a lightweight MFCC + heuristic classifier
+so the real-time pipeline always runs (just with lower accuracy).
+
+PyTorch ships wheels for Python 3.14, so the deep-learning path runs on the
+user's existing interpreter (TensorFlow has no 3.14 wheels yet, which is why the
+project migrated off YAMNet/Keras).
 """
 
 import numpy as np
 import logging
+from pathlib import Path
 from collections import deque
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-# AudioSet/YAMNet exposes 521 classes. Rather than hard-coding fragile class
-# indices (the previous approach guessed wrong ranges), we map each class to one
-# of our 5 categories by matching its display_name against keyword lists at
-# runtime. Matching is exclusive and priority-ordered (CATEGORY_PRIORITY): the
-# first category whose keyword set matches wins, so e.g. "Train horn" → alarm
-# while plain "Train" → environment.
-CATEGORY_KEYWORDS = {
-    "alarm": [
-        "alarm", "siren", "smoke detector", "fire alarm", "buzzer",
-        "beep, bleep", "car alarm", "civil defense", "emergency vehicle",
-        "ambulance", "police car", "fire engine", "air horn", "truck horn",
-        "vehicle horn", "car horn", "honking", "train horn", "foghorn",
-        "doorbell", "alarm clock", "telephone bell",
-    ],
-    "keyboard": ["computer keyboard", "typing", "typewriter"],
-    "speech": [
-        "speech", "conversation", "narration", "monologue", "shout", "yell",
-        "screaming", "babbling", "whispering", "hubbub",
-    ],
-    "music": [
-        "music", "musical instrument", "guitar", "piano", "drum", "violin",
-        "trumpet", "flute", "singing", "melody", "saxophone", "cello", "organ",
-        "banjo", "synthesizer", "choir", "harp", "accordion", "harmonica",
-        "mandolin", "ukulele", "orchestra", "wind instrument",
-        "brass instrument", "plucked string", "percussion", "cymbal",
-        "rapping", "chant", "trombone", "fiddle", "marimba", "glockenspiel",
-        "zither",
-    ],
-    "environment": [
-        "wind", "rain", "thunder", "traffic", "footsteps", "air conditioning",
-        "mechanical fan", "white noise", "pink noise", "outside", "vehicle",
-        "engine", "rustling", "water", "stream", "river", "ocean", "waves",
-        "boat", "aircraft", "train", "bird", "insect", "crowd", "static",
-        "mains hum",
-    ],
-}
-
-# Exclusive assignment order — highest priority first.
-CATEGORY_PRIORITY = ["alarm", "keyboard", "speech", "music", "environment"]
 
 CATEGORIES = ["alarm", "speech", "music", "keyboard", "environment"]
 CATEGORY_DISPLAY = {
@@ -62,100 +28,88 @@ CATEGORY_DISPLAY = {
     "environment": "환경 소음",
 }
 
+DEFAULT_CNN_PATH = Path(__file__).parent.parent / "models" / "cnn_torch.pt"
 
-class YAMNetClassifier:
-    """YAMNet-based classifier with category mapping."""
 
-    def __init__(self, smoothing_window: int = 5):
+class TorchCNNClassifier:
+    """
+    PyTorch CNN classifier over log-mel spectrograms.
+
+    Loads a checkpoint saved by training/train_cnn.py (--mode cnn). The
+    checkpoint bundles the model weights plus the category list, n_mels, and the
+    log-mel normalisation stats (mean/std) used at train time so inference
+    matches training exactly.
+    """
+
+    def __init__(self, model_path: Optional[str] = None, smoothing_window: int = 5):
         self._model = None
-        self._class_names = None
-        self._category_indices: dict = {}
         self._loaded = False
-        self._smoothing_window = smoothing_window
+        self._categories = CATEGORIES
+        self._n_mels = 64
+        self._mean = 0.0
+        self._std = 1.0
         self._score_history: deque = deque(maxlen=smoothing_window)
-        self._load_model()
+        if model_path:
+            self._load(model_path)
 
-    def _load_model(self):
+    def _load(self, path: str):
         try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-            self._model = hub.load("https://tfhub.dev/google/yamnet/1")
-            # Resolve class names from the model asset
-            class_map_path = self._model.class_map_path().numpy().decode()
-            import csv
-            self._class_names = []
-            with open(class_map_path) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    self._class_names.append(row["display_name"])
-            self._build_category_indices()
-            self._loaded = True
-            logger.info("YAMNet model loaded successfully")
-        except Exception as e:
-            logger.warning(f"YAMNet unavailable ({e}), using fallback classifier")
-            self._loaded = False
+            import torch
+            from src.cnn_model import AudioCNN
 
-    def _build_category_indices(self):
-        """Map each YAMNet class to one of our categories by keyword matching."""
-        self._category_indices = {cat: [] for cat in CATEGORIES}
-        for idx, name in enumerate(self._class_names):
-            low = name.lower()
-            for cat in CATEGORY_PRIORITY:
-                if any(kw in low for kw in CATEGORY_KEYWORDS[cat]):
-                    self._category_indices[cat].append(idx)
-                    break
-        counts = {c: len(v) for c, v in self._category_indices.items()}
-        logger.info(f"YAMNet→category mapping built: {counts}")
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            self._categories = ckpt.get("categories", CATEGORIES)
+            self._n_mels = int(ckpt.get("n_mels", 64))
+            self._mean = float(ckpt.get("mean", 0.0))
+            self._std = float(ckpt.get("std", 1.0))
+
+            model = AudioCNN(n_mels=self._n_mels, n_classes=len(self._categories))
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            self._model = model
+            self._loaded = True
+            logger.info(f"PyTorch CNN loaded from {path} "
+                        f"(classes={self._categories})")
+        except Exception as e:
+            logger.warning(f"PyTorch CNN unavailable ({e}), using fallback classifier")
+            self._loaded = False
 
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def _scores_to_category(self, scores: np.ndarray) -> dict:
-        """
-        Aggregate YAMNet per-class scores into our 5 categories.
-
-        Uses max-pooling over each category's class set: the strongest single
-        class is the best evidence that the category is present, which avoids
-        the signal dilution that mean-pooling caused over large class sets.
-        """
-        n = len(scores)
-        category_scores = {}
-        for cat in CATEGORIES:
-            valid = [i for i in self._category_indices.get(cat, []) if i < n]
-            category_scores[cat] = float(np.max(scores[valid])) if valid else 0.0
-
-        total = sum(category_scores.values()) or 1.0
-        return {k: v / total for k, v in category_scores.items()}
-
-    def classify(self, audio: np.ndarray, sample_rate: int = 16000) -> dict:
-        """
-        Returns normalized probability dict over CATEGORIES.
-        audio: float32 mono array, sample_rate must be 16000 for YAMNet.
-        """
+    def classify(self, audio: np.ndarray, sample_rate: int = 16000) -> Optional[dict]:
         if not self._loaded:
             return None
-
         try:
-            import tensorflow as tf
-            audio_tf = tf.constant(audio.astype(np.float32))
-            # YAMNet returns (scores, embeddings, log_mel_spectrogram).
-            # scores shape: (frames, 521); average over frames.
-            scores_tf, _, _ = self._model(audio_tf)
-            mean_scores = tf.reduce_mean(scores_tf, axis=0).numpy()
-            probs = self._scores_to_category(mean_scores)
+            import torch
+            from data.preprocessing import extract_mel_spectrogram
+
+            mel = extract_mel_spectrogram(audio, sr=sample_rate, n_mels=self._n_mels)
+            mel = (mel - self._mean) / (self._std + 1e-6)
+            # (n_mels, frames) → (1, 1, n_mels, frames)
+            x = torch.tensor(mel, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+            with torch.no_grad():
+                logits = self._model(x)
+                probs_t = torch.softmax(logits, dim=1)[0].numpy()
+
+            probs = {c: float(p) for c, p in zip(self._categories, probs_t)}
+            # Pad any categories the model wasn't trained on, for a stable schema.
+            for c in CATEGORIES:
+                probs.setdefault(c, 0.0)
+
             self._score_history.append(probs)
-            # Temporal smoothing
-            smoothed = {cat: float(np.mean([h[cat] for h in self._score_history]))
-                        for cat in CATEGORIES}
+            smoothed = {c: float(np.mean([h[c] for h in self._score_history]))
+                        for c in CATEGORIES}
             return smoothed
         except Exception as e:
-            logger.error(f"YAMNet inference error: {e}")
+            logger.error(f"PyTorch CNN inference error: {e}")
             return None
 
 
 class MFCCClassifier:
     """
-    Lightweight MFCC + heuristic classifier used when YAMNet is unavailable
+    Lightweight MFCC + heuristic classifier used when the CNN is unavailable
     or as a fast pre-filter.
 
     Features used:
@@ -291,7 +245,8 @@ class MFCCClassifier:
 
 class AudioClassifier:
     """
-    Unified classifier that tries YAMNet first, falls back to MFCC classifier.
+    Unified classifier that tries the PyTorch CNN first, then falls back to the
+    MFCC classifier (trained sklearn model if provided, else heuristics).
     Provides a single classify() interface to the rest of the system.
     """
 
@@ -300,17 +255,29 @@ class AudioClassifier:
         smoothing_window: int = 5,
         detection_threshold: float = 0.3,
         mfcc_model_path: Optional[str] = None,
-        use_yamnet: bool = True,
+        cnn_model_path: Optional[str] = None,
+        use_cnn: bool = True,
     ):
         self._threshold = detection_threshold
-        self._yamnet: Optional[YAMNetClassifier] = None
+        self._cnn: Optional[TorchCNNClassifier] = None
         self._mfcc = MFCCClassifier(
             model_path=mfcc_model_path,
             smoothing_window=smoothing_window,
         )
 
-        if use_yamnet:
-            self._yamnet = YAMNetClassifier(smoothing_window=smoothing_window)
+        if use_cnn:
+            path = cnn_model_path
+            if path is None and DEFAULT_CNN_PATH.exists():
+                path = str(DEFAULT_CNN_PATH)
+            if path:
+                self._cnn = TorchCNNClassifier(
+                    model_path=path, smoothing_window=smoothing_window
+                )
+            else:
+                logger.info(
+                    "No trained CNN found (models/cnn_torch.pt); using MFCC "
+                    "fallback. Train one with: python training/train_cnn.py --mode cnn"
+                )
 
         self._last_result: Optional[dict] = None
 
@@ -321,8 +288,8 @@ class AudioClassifier:
         """
         result = None
 
-        if self._yamnet and self._yamnet.is_loaded():
-            result = self._yamnet.classify(audio, sample_rate)
+        if self._cnn and self._cnn.is_loaded():
+            result = self._cnn.classify(audio, sample_rate)
 
         if result is None:
             result = self._mfcc.classify(audio, sample_rate)

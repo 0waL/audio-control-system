@@ -1,5 +1,5 @@
 # Core runtime — works on any Python (incl. 3.14). Runs the real-time app with
-# the YAMNet classifier if TensorFlow is present, otherwise the MFCC fallback.
+# the PyTorch CNN if a trained model + torch are present, else the MFCC fallback.
 numpy>=1.24.0
 scipy>=1.11.0
 librosa>=0.10.0
@@ -16,8 +16,7 @@ psutil>=5.9.0
 pycaw>=20240210; sys_platform == 'win32'
 comtypes>=1.2.0; sys_platform == 'win32'
 
-# Deep learning (YAMNet inference + CNN/transfer-learning training) is split
-# into requirements-ml.txt because TensorFlow has NO wheels for Python 3.14 yet.
-# Use a dedicated Python 3.10–3.13 venv:
-#     py -3.12 -m venv .venv && .venv\Scripts\activate
+# Deep learning (PyTorch CNN training + inference) is in requirements-ml.txt.
+# PyTorch has Python 3.14 wheels, so it installs on the same interpreter — no
+# separate environment needed:
 #     pip install -r requirements-ml.txt

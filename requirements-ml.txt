@@ -1,13 +1,16 @@
-# Deep-learning extras: YAMNet inference + CNN / transfer-learning training.
+# Deep-learning extras: PyTorch CNN training + real-time inference.
 #
-# REQUIRES Python 3.10–3.13 — TensorFlow has no wheels for Python 3.14 yet.
-# Install inside a dedicated virtual environment:
-#     py -3.12 -m venv .venv
-#     .venv\Scripts\activate        (Windows)   |   source .venv/bin/activate (Linux/macOS)
+# PyTorch ships wheels for Python 3.14 (CPU), so this installs on the SAME
+# interpreter as the rest of the project — no separate Python/venv required.
+# (TensorFlow was dropped because it has no Python 3.14 wheels yet.)
+#
 #     pip install -r requirements-ml.txt
+#
+# A CPU build is plenty for this audio CNN. If `pip install torch` is slow or
+# picks the wrong build, use the official CPU index:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
 #
 # This pulls in the core runtime too.
 -r requirements.txt
 
-tensorflow>=2.13,<2.22
-tensorflow-hub>=0.14.0
+torch>=2.10

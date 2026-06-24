@@ -7,7 +7,8 @@ Usage:
   python main.py --cli --verbose    # CLI mode with debug logging
   python main.py --list-devices     # List available microphone devices
   python main.py --device 2         # Use specific microphone device index
-  python main.py --no-yamnet        # Disable YAMNet, use MFCC heuristics only
+  python main.py --no-cnn           # Disable CNN, use MFCC heuristics only
+  python main.py --cnn-model models/cnn_torch.pt     # Load custom PyTorch CNN
   python main.py --model models/mfcc_classifier.pkl  # Load custom MFCC model
 """
 
@@ -31,8 +32,10 @@ def parse_args():
                         help="List available microphone devices and exit")
     parser.add_argument("--device", type=int, default=None,
                         help="Microphone device index (default: system default)")
-    parser.add_argument("--no-yamnet", action="store_true",
-                        help="Disable YAMNet; use MFCC heuristic classifier only")
+    parser.add_argument("--no-cnn", action="store_true",
+                        help="Disable PyTorch CNN; use MFCC/heuristic classifier only")
+    parser.add_argument("--cnn-model", type=str, default=None,
+                        help="Path to a trained PyTorch CNN (.pt)")
     parser.add_argument("--model", type=str, default=None,
                         help="Path to a trained MFCC classifier (.pkl)")
     parser.add_argument("--sample-rate", type=int, default=16000,
@@ -51,9 +54,9 @@ def setup_logging(verbose: bool):
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Silence noisy libraries
-    logging.getLogger("tensorflow").setLevel(logging.ERROR)
-    logging.getLogger("absl").setLevel(logging.ERROR)
+    # Silence noisy numba/matplotlib font chatter at debug level
+    logging.getLogger("numba").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
 def main():
@@ -88,7 +91,8 @@ def main():
         chunk_ms=args.chunk_ms,
         mic_device=args.device,
         mfcc_model_path=args.model,
-        use_yamnet=not args.no_yamnet,
+        cnn_model_path=args.cnn_model,
+        use_cnn=not args.no_cnn,
     )
 
     # ── CLI mode ─────────────────────────────────────────────────────

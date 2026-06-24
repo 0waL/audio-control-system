@@ -18,7 +18,7 @@ from typing import Optional, Iterator
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000       # YAMNet requirement; MFCC model also uses this
+SAMPLE_RATE = 16000       # project standard for CNN mel features and MFCC
 CLIP_DURATION = 1.0       # seconds per training sample
 N_MFCC = 13
 N_MELS = 64
