@@ -13,34 +13,45 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Mapping from YAMNet class indices (AudioSet) to our 5 categories.
-# Selected based on AudioSet ontology labels relevant to each category.
-YAMNET_CLASS_MAP = {
+# AudioSet/YAMNet exposes 521 classes. Rather than hard-coding fragile class
+# indices (the previous approach guessed wrong ranges), we map each class to one
+# of our 5 categories by matching its display_name against keyword lists at
+# runtime. Matching is exclusive and priority-ordered (CATEGORY_PRIORITY): the
+# first category whose keyword set matches wins, so e.g. "Train horn" → alarm
+# while plain "Train" → environment.
+CATEGORY_KEYWORDS = {
     "alarm": [
-        0, 1, 2, 3, 4, 5, 6,          # Explosion, gunshot, firework
-        396, 397, 398, 399, 400,        # Alarm, siren, smoke detector
-        401, 402, 403, 404, 405,        # Civil defense siren, ambulance, police car
-        406, 407, 408, 409, 410,        # Fire truck, emergency vehicle
-        411, 412, 413,                  # Air horn, train horn, bicycle bell
+        "alarm", "siren", "smoke detector", "fire alarm", "buzzer",
+        "beep, bleep", "car alarm", "civil defense", "emergency vehicle",
+        "ambulance", "police car", "fire engine", "air horn", "truck horn",
+        "vehicle horn", "car horn", "honking", "train horn", "foghorn",
+        "doorbell", "alarm clock", "telephone bell",
     ],
+    "keyboard": ["computer keyboard", "typing", "typewriter"],
     "speech": [
-        0,   # (overridden below — speech dominates in AudioSet)
-        # Speech, narration, monologue, conversation, crowd
-        # AudioSet IDs for speech-related sounds
-        0, 1, 2, 3,
+        "speech", "conversation", "narration", "monologue", "shout", "yell",
+        "screaming", "babbling", "whispering", "hubbub",
     ],
-    "music": list(range(137, 184)),     # Music-related AudioSet classes
-    "keyboard": [400, 401, 402, 403],  # Typing keyboard, mouse, mechanical
-    "environment": list(range(0, 15)),  # Wind, rain, crowd, background noise
+    "music": [
+        "music", "musical instrument", "guitar", "piano", "drum", "violin",
+        "trumpet", "flute", "singing", "melody", "saxophone", "cello", "organ",
+        "banjo", "synthesizer", "choir", "harp", "accordion", "harmonica",
+        "mandolin", "ukulele", "orchestra", "wind instrument",
+        "brass instrument", "plucked string", "percussion", "cymbal",
+        "rapping", "chant", "trombone", "fiddle", "marimba", "glockenspiel",
+        "zither",
+    ],
+    "environment": [
+        "wind", "rain", "thunder", "traffic", "footsteps", "air conditioning",
+        "mechanical fan", "white noise", "pink noise", "outside", "vehicle",
+        "engine", "rustling", "water", "stream", "river", "ocean", "waves",
+        "boat", "aircraft", "train", "bird", "insect", "crowd", "static",
+        "mains hum",
+    ],
 }
 
-# These are proper AudioSet indices; final mapping resolved at runtime.
-YAMNET_SPEECH_INDICES = list(range(0, 4))       # Speech variants
-YAMNET_MUSIC_INDICES = list(range(137, 184))    # Music
-YAMNET_ALARM_INDICES = [396, 397, 398, 399, 400, 401, 402, 403, 404, 405,
-                        406, 407, 408, 409, 410, 411, 412, 413]
-YAMNET_KEYBOARD_INDICES = [514, 515, 516]       # Typing, keyboard
-YAMNET_ENV_INDICES = list(range(289, 320))      # Wind, rain, nature, crowd
+# Exclusive assignment order — highest priority first.
+CATEGORY_PRIORITY = ["alarm", "keyboard", "speech", "music", "environment"]
 
 CATEGORIES = ["alarm", "speech", "music", "keyboard", "environment"]
 CATEGORY_DISPLAY = {
@@ -58,6 +69,7 @@ class YAMNetClassifier:
     def __init__(self, smoothing_window: int = 5):
         self._model = None
         self._class_names = None
+        self._category_indices: dict = {}
         self._loaded = False
         self._smoothing_window = smoothing_window
         self._score_history: deque = deque(maxlen=smoothing_window)
@@ -76,29 +88,41 @@ class YAMNetClassifier:
                 reader = csv.DictReader(f)
                 for row in reader:
                     self._class_names.append(row["display_name"])
+            self._build_category_indices()
             self._loaded = True
             logger.info("YAMNet model loaded successfully")
         except Exception as e:
             logger.warning(f"YAMNet unavailable ({e}), using fallback classifier")
             self._loaded = False
 
+    def _build_category_indices(self):
+        """Map each YAMNet class to one of our categories by keyword matching."""
+        self._category_indices = {cat: [] for cat in CATEGORIES}
+        for idx, name in enumerate(self._class_names):
+            low = name.lower()
+            for cat in CATEGORY_PRIORITY:
+                if any(kw in low for kw in CATEGORY_KEYWORDS[cat]):
+                    self._category_indices[cat].append(idx)
+                    break
+        counts = {c: len(v) for c, v in self._category_indices.items()}
+        logger.info(f"YAMNet→category mapping built: {counts}")
+
     def is_loaded(self) -> bool:
         return self._loaded
 
     def _scores_to_category(self, scores: np.ndarray) -> dict:
-        """Aggregate YAMNet per-class scores into our 5 categories."""
+        """
+        Aggregate YAMNet per-class scores into our 5 categories.
+
+        Uses max-pooling over each category's class set: the strongest single
+        class is the best evidence that the category is present, which avoids
+        the signal dilution that mean-pooling caused over large class sets.
+        """
         n = len(scores)
-        category_scores = {cat: 0.0 for cat in CATEGORIES}
-
-        def safe_mean(indices):
-            valid = [i for i in indices if i < n]
-            return float(np.mean(scores[valid])) if valid else 0.0
-
-        category_scores["alarm"] = safe_mean(YAMNET_ALARM_INDICES)
-        category_scores["speech"] = safe_mean(YAMNET_SPEECH_INDICES)
-        category_scores["music"] = safe_mean(YAMNET_MUSIC_INDICES)
-        category_scores["keyboard"] = safe_mean(YAMNET_KEYBOARD_INDICES)
-        category_scores["environment"] = safe_mean(YAMNET_ENV_INDICES)
+        category_scores = {}
+        for cat in CATEGORIES:
+            valid = [i for i in self._category_indices.get(cat, []) if i < n]
+            category_scores[cat] = float(np.max(scores[valid])) if valid else 0.0
 
         total = sum(category_scores.values()) or 1.0
         return {k: v / total for k, v in category_scores.items()}
@@ -114,16 +138,14 @@ class YAMNetClassifier:
         try:
             import tensorflow as tf
             audio_tf = tf.constant(audio.astype(np.float32))
-            _, embeddings, spectrogram = self._model(audio_tf)
-            # scores shape: (frames, 521); average over frames
-            scores_np = embeddings.numpy()  # we need raw class scores
-            # Re-run to get scores
+            # YAMNet returns (scores, embeddings, log_mel_spectrogram).
+            # scores shape: (frames, 521); average over frames.
             scores_tf, _, _ = self._model(audio_tf)
             mean_scores = tf.reduce_mean(scores_tf, axis=0).numpy()
             probs = self._scores_to_category(mean_scores)
             self._score_history.append(probs)
             # Temporal smoothing
-            smoothed = {cat: np.mean([h[cat] for h in self._score_history])
+            smoothed = {cat: float(np.mean([h[cat] for h in self._score_history]))
                         for cat in CATEGORIES}
             return smoothed
         except Exception as e:
