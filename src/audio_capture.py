@@ -44,6 +44,8 @@ class AudioCapture:
         self._overlap_samples = int(sample_rate * overlap_ms / 1000)
         self._device = device
         self._channels = channels
+        # Hardware capture rate; may differ from target rate and get resampled.
+        self._capture_rate = sample_rate
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -101,29 +103,97 @@ class AudioCapture:
         """sounddevice stream callback — called from audio thread."""
         if status:
             logger.warning(f"sounddevice status: {status}")
-        mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+        # Downmix to mono (average channels) so multi-channel mics still work.
+        mono = indata.mean(axis=1) if indata.ndim > 1 else indata.flatten()
+        # Resample to the target rate if the device captured at a different rate.
+        if self._capture_rate != self._sample_rate and len(mono) > 1:
+            n_out = int(round(len(mono) * self._sample_rate / self._capture_rate))
+            if n_out > 0:
+                mono = np.interp(
+                    np.linspace(0, len(mono), n_out, endpoint=False),
+                    np.arange(len(mono)),
+                    mono,
+                ).astype(np.float32)
         try:
-            self._audio_queue.put_nowait(mono.copy())
+            self._audio_queue.put_nowait(np.ascontiguousarray(mono, dtype=np.float32))
         except queue.Full:
             logger.debug("Audio queue full, dropping frame")
 
     def _capture_loop(self):
         try:
             import sounddevice as sd
-            with sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=self._channels,
-                dtype="float32",
-                device=self._device,
-                callback=self._sounddevice_callback,
-                blocksize=int(self._sample_rate * 0.05),  # 50 ms blocks
-            ):
-                self._process_queue()
         except ImportError:
             logger.error("sounddevice not installed; using synthetic audio for testing")
             self._synthetic_loop()
+            return
+
+        channels, samplerate = self._resolve_stream_params(sd)
+        if channels is None:
+            return  # device unusable; error already logged
+
+        self._channels = channels
+        self._capture_rate = samplerate
+        try:
+            with sd.InputStream(
+                samplerate=samplerate,
+                channels=channels,
+                dtype="float32",
+                device=self._device,
+                callback=self._sounddevice_callback,
+                blocksize=int(samplerate * 0.05),  # 50 ms blocks
+            ):
+                self._process_queue()
         except Exception as e:
-            logger.error(f"Audio capture error: {e}")
+            logger.error(
+                f"Audio capture error: {e}. "
+                f"Check the device index with: python main.py --list-devices"
+            )
+
+    def _resolve_stream_params(self, sd):
+        """Pick a channel count and sample rate the device actually supports.
+
+        Returns (channels, samplerate), or (None, None) if the device has no
+        usable input. Falls back to the device's default sample rate when the
+        target rate is unsupported (audio is resampled in the callback).
+        """
+        channels = self._channels
+        samplerate = self._sample_rate
+        try:
+            info = sd.query_devices(self._device, "input")
+        except Exception as e:
+            logger.warning(f"Could not query device {self._device}: {e}")
+            return channels, samplerate
+
+        name = info.get("name", "?")
+        max_in = int(info.get("max_input_channels", 0))
+        if max_in <= 0:
+            logger.error(
+                f"Device {self._device} ('{name}') has no input channels — "
+                f"it can't record. Run: python main.py --list-devices "
+                f"and pass a microphone index via --device."
+            )
+            return None, None
+        if channels > max_in:
+            logger.warning(
+                f"Device '{name}' supports {max_in} input channel(s); "
+                f"requested {channels}. Using {max_in}."
+            )
+            channels = max_in
+
+        try:
+            sd.check_input_settings(
+                device=self._device, channels=channels,
+                samplerate=samplerate, dtype="float32",
+            )
+        except Exception as e:
+            fallback = int(info.get("default_samplerate", 0)) or samplerate
+            logger.warning(
+                f"{samplerate} Hz not supported by '{name}' ({e}); "
+                f"capturing at {fallback} Hz and resampling to {self._sample_rate} Hz."
+            )
+            samplerate = fallback
+
+        return channels, samplerate
 
     def _process_queue(self):
         """Assemble overlapping chunks from queued raw blocks and call callback."""
