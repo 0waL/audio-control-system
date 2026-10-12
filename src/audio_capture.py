@@ -17,8 +17,10 @@ AudioCallback = Callable[[np.ndarray, int], None]
 
 # YAMNet requires 16 kHz; MFCC heuristic works at any rate.
 DEFAULT_SAMPLE_RATE = 16000
-DEFAULT_CHUNK_MS = 500
-DEFAULT_OVERLAP_MS = 100
+# 1 s analysis window (YAMNet input length and the training clip length),
+# emitted every 400 ms.
+DEFAULT_CHUNK_MS = 1000
+DEFAULT_HOP_MS = 400
 
 
 class AudioCapture:
@@ -27,6 +29,8 @@ class AudioCapture:
 
     The callback receives (audio_chunk: np.ndarray[float32], sample_rate: int).
     Chunks overlap by `overlap_ms` to avoid classification artifacts at boundaries.
+    By default the overlap is chosen so a new chunk arrives every DEFAULT_HOP_MS
+    whatever the chunk length.
     """
 
     def __init__(
@@ -34,13 +38,17 @@ class AudioCapture:
         callback: AudioCallback,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         chunk_ms: int = DEFAULT_CHUNK_MS,
-        overlap_ms: int = DEFAULT_OVERLAP_MS,
+        overlap_ms: Optional[int] = None,
         device: Optional[int] = None,
         channels: int = 1,
     ):
         self._callback = callback
         self._sample_rate = sample_rate
         self._chunk_samples = int(sample_rate * chunk_ms / 1000)
+        if overlap_ms is None:
+            overlap_ms = max(0, chunk_ms - DEFAULT_HOP_MS)
+        if not 0 <= overlap_ms < chunk_ms:
+            raise ValueError(f"overlap_ms must be in [0, chunk_ms), got {overlap_ms}")
         self._overlap_samples = int(sample_rate * overlap_ms / 1000)
         self._device = device
         self._channels = channels

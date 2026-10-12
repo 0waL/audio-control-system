@@ -91,3 +91,16 @@ class TestAudioCapture:
             cap.stop()
 
         assert call_count[0] >= 3
+
+    def test_default_window_is_one_second_every_400ms(self):
+        cap = AudioCapture(callback=lambda a, s: None, sample_rate=16000)
+        assert cap._chunk_samples == 16000
+        assert cap._chunk_samples - cap._overlap_samples == 6400   # 400 ms hop
+
+    def test_shorter_window_keeps_400ms_hop(self):
+        cap = AudioCapture(callback=lambda a, s: None, sample_rate=16000, chunk_ms=500)
+        assert cap._chunk_samples - cap._overlap_samples == 6400
+
+    def test_overlap_must_be_shorter_than_chunk(self):
+        with pytest.raises(ValueError):
+            AudioCapture(callback=lambda a, s: None, chunk_ms=500, overlap_ms=500)

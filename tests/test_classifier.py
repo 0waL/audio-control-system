@@ -243,3 +243,23 @@ class TestTrainedModels:
         probs = clf.classify(_sine(440), SR)
         assert set(probs) == set(CATEGORIES)
         assert abs(sum(probs.values()) - 1.0) < 1e-5
+
+
+class TestYAMNetInputLength:
+    @pytest.mark.parametrize("seconds, sr", [(0.5, SR), (1.0, SR), (2.5, SR), (1.0, 22050)])
+    def test_yamnet_always_gets_one_second(self, seconds, sr):
+        tf = pytest.importorskip("tensorflow")
+        seen = []
+
+        def fake_yamnet(waveform):
+            seen.append(int(waveform.shape[0]))
+            return tf.zeros((1, 521)), tf.zeros((1, 1024)), None
+
+        with patch.object(YAMNetClassifier, "_load_model", lambda self: None):
+            clf = YAMNetClassifier(smoothing_window=1)
+        clf._model = fake_yamnet
+        clf._category_indices = build_category_indices(_fake_class_names())
+        clf._loaded = True
+        audio = np.random.randn(int(sr * seconds)).astype(np.float32) * 0.1
+        assert clf.classify(audio, sr) is not None
+        assert seen == [16000]

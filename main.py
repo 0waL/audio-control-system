@@ -42,8 +42,9 @@ def parse_args():
                              "mel-spectrogram CNN or YAMNet head (.keras)")
     parser.add_argument("--sample-rate", type=int, default=16000,
                         help="Microphone sample rate in Hz (default: 16000)")
-    parser.add_argument("--chunk-ms", type=int, default=500,
-                        help="Audio chunk duration in ms (default: 500)")
+    parser.add_argument("--chunk-ms", type=int, default=1000,
+                        help="Audio analysis window in ms; a new window is "
+                             "classified every 400 ms (default: 1000)")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to custom priorities JSON config")
     return parser.parse_args()
