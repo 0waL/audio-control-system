@@ -9,12 +9,17 @@ Usage:
   python main.py --device 2         # Use specific microphone device index
   python main.py --no-yamnet        # Disable YAMNet, use MFCC heuristics only
   python main.py --model models/mfcc_classifier.pkl  # Load custom MFCC model
+  python main.py --model models/cnn_classifier.keras # Load trained CNN / YAMNet head
+
+Note: with loudspeakers the microphone also hears what the computer itself
+plays, so the system may duck its own audio. Headphones avoid this.
 """
 
 import argparse
 import logging
 import sys
 import signal
+import threading
 import time
 
 
@@ -33,7 +38,8 @@ def parse_args():
     parser.add_argument("--no-yamnet", action="store_true",
                         help="Disable YAMNet; use MFCC heuristic classifier only")
     parser.add_argument("--model", type=str, default=None,
-                        help="Path to a trained MFCC classifier (.pkl)")
+                        help="Path to a trained model: MFCC classifier (.pkl), "
+                             "mel-spectrogram CNN or YAMNet head (.keras)")
     parser.add_argument("--sample-rate", type=int, default=16000,
                         help="Microphone sample rate in Hz (default: 16000)")
     parser.add_argument("--chunk-ms", type=int, default=500,
@@ -86,7 +92,7 @@ def main():
         sample_rate=args.sample_rate,
         chunk_ms=args.chunk_ms,
         mic_device=args.device,
-        mfcc_model_path=args.model,
+        model_path=args.model,
         use_yamnet=not args.no_yamnet,
     )
 
@@ -114,6 +120,7 @@ def _run_cli(engine, pm):
     print("\n" + "─" * 60)
     print("  오디오 우선순위 제어 시스템 — CLI 모드")
     print("  Ctrl+C 로 종료")
+    print("  ※ 스피커 사용 시 마이크가 재생 중인 소리를 다시 감지할 수 있어 헤드폰을 권장합니다")
     print("─" * 60 + "\n")
 
     shutdown = threading.Event()
@@ -122,7 +129,6 @@ def _run_cli(engine, pm):
         print("\n종료 중 ...")
         shutdown.set()
 
-    import threading
     signal.signal(signal.SIGINT, _sigint)
 
     try:

@@ -1,46 +1,21 @@
 """
-Real-time audio classifier using YAMNet (transfer learning) and custom CNN.
+Real-time audio classifier using YAMNet (transfer learning) and custom models.
 
-YAMNet is pre-trained on AudioSet (~521 classes). We map its output to our
-5 target categories via a learned classification head, then fall back to
-MFCC-based CNN when TensorFlow Hub is unavailable.
+YAMNet is pre-trained on AudioSet (521 classes). Its class scores are mapped to
+our 5 target categories by class name, or — when a head trained with
+`training/train_cnn.py --mode yamnet` is supplied — its embeddings are fed to
+that learned classification head. A mel-spectrogram CNN (`--mode cnn`) or an
+sklearn MFCC model (`--mode mfcc`) can be loaded instead, and an MFCC heuristic
+classifier is always available as the final fallback.
 """
 
 import numpy as np
 import logging
 from collections import deque
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-# Mapping from YAMNet class indices (AudioSet) to our 5 categories.
-# Selected based on AudioSet ontology labels relevant to each category.
-YAMNET_CLASS_MAP = {
-    "alarm": [
-        0, 1, 2, 3, 4, 5, 6,          # Explosion, gunshot, firework
-        396, 397, 398, 399, 400,        # Alarm, siren, smoke detector
-        401, 402, 403, 404, 405,        # Civil defense siren, ambulance, police car
-        406, 407, 408, 409, 410,        # Fire truck, emergency vehicle
-        411, 412, 413,                  # Air horn, train horn, bicycle bell
-    ],
-    "speech": [
-        0,   # (overridden below — speech dominates in AudioSet)
-        # Speech, narration, monologue, conversation, crowd
-        # AudioSet IDs for speech-related sounds
-        0, 1, 2, 3,
-    ],
-    "music": list(range(137, 184)),     # Music-related AudioSet classes
-    "keyboard": [400, 401, 402, 403],  # Typing keyboard, mouse, mechanical
-    "environment": list(range(0, 15)),  # Wind, rain, crowd, background noise
-}
-
-# These are proper AudioSet indices; final mapping resolved at runtime.
-YAMNET_SPEECH_INDICES = list(range(0, 4))       # Speech variants
-YAMNET_MUSIC_INDICES = list(range(137, 184))    # Music
-YAMNET_ALARM_INDICES = [396, 397, 398, 399, 400, 401, 402, 403, 404, 405,
-                        406, 407, 408, 409, 410, 411, 412, 413]
-YAMNET_KEYBOARD_INDICES = [514, 515, 516]       # Typing, keyboard
-YAMNET_ENV_INDICES = list(range(289, 320))      # Wind, rain, nature, crowd
 
 CATEGORIES = ["alarm", "speech", "music", "keyboard", "environment"]
 CATEGORY_DISPLAY = {
@@ -51,33 +26,132 @@ CATEGORY_DISPLAY = {
     "environment": "환경 소음",
 }
 
+YAMNET_SAMPLE_RATE = 16000
+
+# YAMNet (AudioSet) display names mapped to our 5 categories. Indices are
+# resolved at runtime from the class map shipped with the model.
+YAMNET_CATEGORY_CLASSES = {
+    "alarm": [
+        "Alarm", "Alarm clock", "Siren", "Civil defense siren", "Buzzer",
+        "Smoke detector, smoke alarm", "Fire alarm", "Foghorn", "Car alarm",
+        "Emergency vehicle", "Police car (siren)", "Ambulance (siren)",
+        "Fire engine, fire truck (siren)", "Vehicle horn, car horn, honking",
+        "Air horn, truck horn", "Reversing beeps", "Screaming", "Explosion",
+        "Gunshot, gunfire", "Shatter",
+    ],
+    "speech": [
+        "Speech", "Child speech, kid speaking", "Conversation",
+        "Narration, monologue", "Babbling", "Speech synthesizer", "Shout",
+        "Yell", "Whispering", "Laughter", "Crying, sobbing",
+        "Baby cry, infant cry",
+    ],
+    # Plus every class between YAMNET_MUSIC_RANGE (instruments and genres)
+    "music": ["Singing", "Choir", "Rapping", "Humming"],
+    "keyboard": ["Typing", "Typewriter", "Computer keyboard", "Clicking"],
+    "environment": [
+        "Wind", "Rustling leaves", "Wind noise (microphone)", "Thunderstorm",
+        "Thunder", "Rain", "Rain on surface", "Water", "Stream", "Ocean",
+        "Waves, surf", "Bird", "Crowd", "Hubbub, speech noise, speech babble",
+        "Vehicle", "Traffic noise, roadway noise", "Engine", "Mechanical fan",
+        "Air conditioning", "Vacuum cleaner", "Inside, small room",
+        "Inside, large room or hall", "Inside, public space",
+        "Outside, urban or manmade", "Outside, rural or natural", "Noise",
+        "Environmental noise", "Static", "Mains hum", "Hum", "White noise",
+        "Pink noise",
+    ],
+}
+YAMNET_MUSIC_RANGE = ("Music", "Scary music")
+
+# Below this best per-category YAMNet score the chunk is treated as
+# "nothing recognisable" (e.g. silence) rather than normalised up.
+YAMNET_MIN_SCORE = 0.1
+
+
+def _uniform_probs() -> dict:
+    return {cat: 1.0 / len(CATEGORIES) for cat in CATEGORIES}
+
+
+def build_category_indices(class_names: list) -> dict:
+    """Resolve YAMNET_CATEGORY_CLASSES to YAMNet class indices."""
+    lookup = {name: i for i, name in enumerate(class_names)}
+    indices = {}
+    for cat, names in YAMNET_CATEGORY_CLASSES.items():
+        missing = [n for n in names if n not in lookup]
+        if missing:
+            logger.warning(f"YAMNet classes not found for '{cat}': {missing}")
+        indices[cat] = [lookup[n] for n in names if n in lookup]
+
+    first, last = YAMNET_MUSIC_RANGE
+    if first in lookup and last in lookup:
+        music_range = range(lookup[first], lookup[last] + 1)
+        indices["music"] = sorted(set(indices["music"]) | set(music_range))
+    else:
+        logger.warning(f"YAMNet music range {YAMNET_MUSIC_RANGE} not found")
+    return indices
+
+
+def aggregate_scores(scores: np.ndarray, category_indices: dict) -> dict:
+    """
+    Collapse YAMNet per-class scores into our categories (max over member
+    classes), normalised to sum to 1.
+    """
+    raw = {
+        cat: float(np.max(scores[idx])) if idx else 0.0
+        for cat, idx in category_indices.items()
+    }
+    if max(raw.values()) < YAMNET_MIN_SCORE:
+        return _uniform_probs()
+    total = sum(raw.values())
+    return {cat: raw[cat] / total for cat in CATEGORIES}
+
+
+def _resample(audio: np.ndarray, sample_rate: int, target_sr: int) -> np.ndarray:
+    if sample_rate == target_sr:
+        return audio
+    import librosa
+    return librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sr)
+
+
+class _TemporalSmoother:
+    """Moving average of the last `window` probability dicts."""
+
+    def __init__(self, window: int):
+        self._history: deque = deque(maxlen=max(1, window))
+
+    def update(self, probs: dict) -> dict:
+        self._history.append(probs)
+        return {cat: float(np.mean([h[cat] for h in self._history]))
+                for cat in CATEGORIES}
+
 
 class YAMNetClassifier:
-    """YAMNet-based classifier with category mapping."""
+    """
+    YAMNet-based classifier. Without a head, class scores are mapped to our
+    categories by name; with a trained head (Keras model on 1024-d mean
+    embeddings), the head's softmax output is used directly.
+    """
 
-    def __init__(self, smoothing_window: int = 5):
+    def __init__(self, smoothing_window: int = 5, head=None):
         self._model = None
-        self._class_names = None
+        self._head = head
+        self._category_indices: dict = {}
         self._loaded = False
-        self._smoothing_window = smoothing_window
-        self._score_history: deque = deque(maxlen=smoothing_window)
+        self._smoother = _TemporalSmoother(smoothing_window)
         self._load_model()
 
     def _load_model(self):
         try:
-            import tensorflow as tf
             import tensorflow_hub as hub
             self._model = hub.load("https://tfhub.dev/google/yamnet/1")
             # Resolve class names from the model asset
             class_map_path = self._model.class_map_path().numpy().decode()
             import csv
-            self._class_names = []
-            with open(class_map_path) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    self._class_names.append(row["display_name"])
+            with open(class_map_path, encoding="utf-8", newline="") as f:
+                class_names = [row["display_name"] for row in csv.DictReader(f)]
+            self._category_indices = build_category_indices(class_names)
             self._loaded = True
-            logger.info("YAMNet model loaded successfully")
+            logger.info("YAMNet model loaded successfully"
+                        + (" (with trained head)" if self._head is not None else ""))
         except Exception as e:
             logger.warning(f"YAMNet unavailable ({e}), using fallback classifier")
             self._loaded = False
@@ -85,50 +159,99 @@ class YAMNetClassifier:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def _scores_to_category(self, scores: np.ndarray) -> dict:
-        """Aggregate YAMNet per-class scores into our 5 categories."""
-        n = len(scores)
-        category_scores = {cat: 0.0 for cat in CATEGORIES}
-
-        def safe_mean(indices):
-            valid = [i for i in indices if i < n]
-            return float(np.mean(scores[valid])) if valid else 0.0
-
-        category_scores["alarm"] = safe_mean(YAMNET_ALARM_INDICES)
-        category_scores["speech"] = safe_mean(YAMNET_SPEECH_INDICES)
-        category_scores["music"] = safe_mean(YAMNET_MUSIC_INDICES)
-        category_scores["keyboard"] = safe_mean(YAMNET_KEYBOARD_INDICES)
-        category_scores["environment"] = safe_mean(YAMNET_ENV_INDICES)
-
-        total = sum(category_scores.values()) or 1.0
-        return {k: v / total for k, v in category_scores.items()}
-
-    def classify(self, audio: np.ndarray, sample_rate: int = 16000) -> dict:
+    def classify(self, audio: np.ndarray, sample_rate: int = YAMNET_SAMPLE_RATE) -> Optional[dict]:
         """
         Returns normalized probability dict over CATEGORIES.
-        audio: float32 mono array, sample_rate must be 16000 for YAMNet.
+        audio: float32 mono array; resampled to 16 kHz if needed.
         """
         if not self._loaded:
             return None
 
         try:
             import tensorflow as tf
-            audio_tf = tf.constant(audio.astype(np.float32))
-            _, embeddings, spectrogram = self._model(audio_tf)
-            # scores shape: (frames, 521); average over frames
-            scores_np = embeddings.numpy()  # we need raw class scores
-            # Re-run to get scores
-            scores_tf, _, _ = self._model(audio_tf)
-            mean_scores = tf.reduce_mean(scores_tf, axis=0).numpy()
-            probs = self._scores_to_category(mean_scores)
-            self._score_history.append(probs)
-            # Temporal smoothing
-            smoothed = {cat: np.mean([h[cat] for h in self._score_history])
-                        for cat in CATEGORIES}
-            return smoothed
+            audio = _resample(audio, sample_rate, YAMNET_SAMPLE_RATE)
+            # scores: (frames, 521), embeddings: (frames, 1024)
+            scores, embeddings, _ = self._model(tf.constant(audio.astype(np.float32)))
+            if self._head is not None:
+                emb = tf.reduce_mean(embeddings, axis=0)[tf.newaxis, :]
+                out = np.asarray(self._head(emb, training=False))[0]
+                probs = {cat: float(p) for cat, p in zip(CATEGORIES, out)}
+            else:
+                mean_scores = tf.reduce_mean(scores, axis=0).numpy()
+                probs = aggregate_scores(mean_scores, self._category_indices)
+            return self._smoother.update(probs)
         except Exception as e:
             logger.error(f"YAMNet inference error: {e}")
             return None
+
+
+class CNNClassifier:
+    """
+    Mel-spectrogram CNN trained by `training/train_cnn.py --mode cnn`.
+
+    Feature extraction mirrors data/preprocessing.py: 16 kHz audio clipped or
+    zero-padded to 1 s, log-mel with hop 512. Run with --chunk-ms 1000 to feed
+    the model the same clip length it was trained on.
+    """
+
+    SAMPLE_RATE = 16000     # data/preprocessing.py SAMPLE_RATE
+    CLIP_DURATION = 1.0     # data/preprocessing.py CLIP_DURATION
+    HOP_LENGTH = 512        # data/preprocessing.py HOP_LENGTH
+
+    def __init__(self, model, smoothing_window: int = 5):
+        self._model = model
+        _, self._n_mels, self._frames, _ = model.input_shape
+        self._smoother = _TemporalSmoother(smoothing_window)
+
+    def is_loaded(self) -> bool:
+        return True
+
+    def _log_mel(self, audio: np.ndarray) -> np.ndarray:
+        import librosa
+        target = int(self.SAMPLE_RATE * self.CLIP_DURATION)
+        if len(audio) >= target:
+            audio = audio[:target]
+        else:
+            audio = np.pad(audio, (0, target - len(audio)))
+        mel = librosa.feature.melspectrogram(y=audio, sr=self.SAMPLE_RATE,
+                                             n_mels=self._n_mels,
+                                             hop_length=self.HOP_LENGTH)
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+        if self._frames is not None:
+            if log_mel.shape[1] >= self._frames:
+                log_mel = log_mel[:, :self._frames]
+            else:
+                pad = self._frames - log_mel.shape[1]
+                log_mel = np.pad(log_mel, ((0, 0), (0, pad)),
+                                 constant_values=float(log_mel.min()))
+        return log_mel.astype(np.float32)
+
+    def classify(self, audio: np.ndarray, sample_rate: int = 16000) -> Optional[dict]:
+        try:
+            audio = _resample(audio, sample_rate, self.SAMPLE_RATE)
+            x = self._log_mel(audio)[np.newaxis, ..., np.newaxis]
+            out = np.asarray(self._model(x, training=False))[0]
+        except Exception as e:
+            logger.error(f"CNN inference error: {e}")
+            return None
+        probs = {cat: float(p) for cat, p in zip(CATEGORIES, out)}
+        return self._smoother.update(probs)
+
+
+def _load_keras_classifier(path: str, smoothing_window: int):
+    """Load a .keras model and wrap it as a CNN or YAMNet-head classifier."""
+    try:
+        import tensorflow as tf
+        model = tf.keras.models.load_model(path)
+    except Exception as e:
+        logger.warning(f"Could not load Keras model {path} ({e})")
+        return None
+
+    if len(model.input_shape) == 2:
+        logger.info(f"Loaded YAMNet classification head from {path}")
+        return YAMNetClassifier(smoothing_window=smoothing_window, head=model)
+    logger.info(f"Loaded mel-spectrogram CNN from {path}")
+    return CNNClassifier(model, smoothing_window=smoothing_window)
 
 
 class MFCCClassifier:
@@ -145,8 +268,7 @@ class MFCCClassifier:
 
     def __init__(self, model_path: Optional[str] = None, smoothing_window: int = 5):
         self._model = None
-        self._smoothing_window = smoothing_window
-        self._score_history: deque = deque(maxlen=smoothing_window)
+        self._smoother = _TemporalSmoother(smoothing_window)
         if model_path:
             self._load_model(model_path)
 
@@ -195,8 +317,8 @@ class MFCCClassifier:
 
         rms = float(np.sqrt(np.mean(audio ** 2)))
         if rms < 0.001:
-            # Silence — treat as environment noise at very low probability
-            return {cat: 0.2 for cat in CATEGORIES}
+            # Silence — no category stands out
+            return _uniform_probs()
 
         zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio)))
         centroid = float(np.mean(
@@ -249,46 +371,62 @@ class MFCCClassifier:
         total = sum(scores.values()) or 1.0
         return {k: v / total for k, v in scores.items()}
 
+    def _model_classify(self, audio: np.ndarray, sample_rate: int) -> dict:
+        features = self._extract_features(audio, sample_rate)
+        probs = self._model.predict_proba([features])[0]
+        # classes_ holds the CATEGORIES indices the model was trained on; a
+        # category missing from the training data has no column at all.
+        classes = getattr(self._model, "classes_", range(len(probs)))
+        result = {cat: 0.0 for cat in CATEGORIES}
+        for cls, p in zip(classes, probs):
+            result[CATEGORIES[int(cls)]] = float(p)
+        return result
+
     def classify(self, audio: np.ndarray, sample_rate: int = 22050) -> dict:
         if self._model is not None:
             try:
-                features = self._extract_features(audio, sample_rate)
-                probs = self._model.predict_proba([features])[0]
-                result = dict(zip(CATEGORIES, probs))
+                result = self._model_classify(audio, sample_rate)
             except Exception as e:
                 logger.warning(f"Model inference failed ({e}), using heuristics")
                 result = self._heuristic_classify(audio, sample_rate)
         else:
             result = self._heuristic_classify(audio, sample_rate)
 
-        self._score_history.append(result)
-        smoothed = {cat: np.mean([h[cat] for h in self._score_history])
-                    for cat in CATEGORIES}
-        return smoothed
+        return self._smoother.update(result)
 
 
 class AudioClassifier:
     """
-    Unified classifier that tries YAMNet first, falls back to MFCC classifier.
-    Provides a single classify() interface to the rest of the system.
+    Unified classifier with a single classify() interface.
+
+    Backend order: an explicitly supplied model (.pkl MFCC model, .keras CNN or
+    YAMNet head) → YAMNet name mapping (if enabled and no .pkl was given) →
+    MFCC heuristics.
     """
 
     def __init__(
         self,
         smoothing_window: int = 5,
         detection_threshold: float = 0.3,
-        mfcc_model_path: Optional[str] = None,
+        model_path: Optional[str] = None,
         use_yamnet: bool = True,
     ):
         self._threshold = detection_threshold
-        self._yamnet: Optional[YAMNetClassifier] = None
+        suffix = Path(model_path).suffix.lower() if model_path else ""
+
         self._mfcc = MFCCClassifier(
-            model_path=mfcc_model_path,
+            model_path=model_path if suffix == ".pkl" else None,
             smoothing_window=smoothing_window,
         )
 
-        if use_yamnet:
-            self._yamnet = YAMNetClassifier(smoothing_window=smoothing_window)
+        self._primary = None
+        if suffix in (".keras", ".h5"):
+            self._primary = _load_keras_classifier(model_path, smoothing_window)
+        elif model_path and suffix != ".pkl":
+            logger.warning(f"Unsupported model file {model_path} (expected .pkl or .keras)")
+
+        if self._primary is None and use_yamnet and suffix != ".pkl":
+            self._primary = YAMNetClassifier(smoothing_window=smoothing_window)
 
         self._last_result: Optional[dict] = None
 
@@ -299,14 +437,17 @@ class AudioClassifier:
         """
         result = None
 
-        if self._yamnet and self._yamnet.is_loaded():
-            result = self._yamnet.classify(audio, sample_rate)
+        if self._primary is not None and self._primary.is_loaded():
+            result = self._primary.classify(audio, sample_rate)
 
         if result is None:
             result = self._mfcc.classify(audio, sample_rate)
 
         self._last_result = result
         return result
+
+    def set_threshold(self, threshold: float):
+        self._threshold = threshold
 
     def top_category(self, probs: dict) -> tuple[str, float]:
         """Return (category_name, confidence) for the highest-probability class."""

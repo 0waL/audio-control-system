@@ -9,6 +9,11 @@ Two modes:
 Usage:
   python training/train_cnn.py --mode mfcc --urbansound /data/UrbanSound8K --esc50 /data/ESC-50
   python training/train_cnn.py --mode cnn  --urbansound /data/UrbanSound8K --epochs 50
+  python training/train_cnn.py --mode mfcc --esc50 /data/ESC-50 --extra-data /data/my_clips
+
+UrbanSound8K and ESC-50 contain almost no speech or music, so add recordings
+of those with --extra-data (one sub-folder per category). Classes are
+re-weighted for balance and the per-category sample count is logged.
 """
 
 import argparse
@@ -21,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.preprocessing import (
-    load_urbansound8k, load_esc50,
+    load_urbansound8k, load_esc50, load_folder,
     build_feature_dataset, build_mel_dataset,
     CATEGORIES, SAMPLE_RATE,
 )
@@ -49,6 +54,7 @@ def train_mfcc(args):
     iters = _make_iterators(args)
     X, y = build_feature_dataset(iters, augment_data=True, augment_factor=2)
     logger.info(f"Dataset: {X.shape[0]} samples, {X.shape[1]} features")
+    _log_class_balance(y)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=42
@@ -57,7 +63,8 @@ def train_mfcc(args):
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", RandomForestClassifier(
-            n_estimators=200, max_depth=20, n_jobs=-1, random_state=42
+            n_estimators=200, max_depth=20, n_jobs=-1, random_state=42,
+            class_weight="balanced",
         )),
     ])
 
@@ -65,7 +72,7 @@ def train_mfcc(args):
     pipeline.fit(X_train, y_train)
 
     y_pred = pipeline.predict(X_test)
-    report = classification_report(y_test, y_pred, target_names=CATEGORIES)
+    report = classification_report(y_test, y_pred, **_REPORT_KWARGS)
     f1 = f1_score(y_test, y_pred, average="weighted")
     logger.info(f"\n{report}")
     logger.info(f"Weighted F1: {f1:.4f}")
@@ -90,6 +97,7 @@ def train_cnn(args):
     iters = _make_iterators(args)
     X, y = build_mel_dataset(iters, augment_data=True, augment_factor=2)
     logger.info(f"Dataset: {X.shape} mel-spectrograms")
+    _log_class_balance(y)
 
     from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(
@@ -116,6 +124,7 @@ def train_cnn(args):
         epochs=args.epochs,
         batch_size=32,
         callbacks=callbacks,
+        class_weight=_class_weights(y_train),
     )
 
     results = model.evaluate(X_test, y_test)
@@ -194,6 +203,7 @@ def train_yamnet_head(args):
     X = np.array(embeddings, dtype=np.float32)
     y = np.array(labels, dtype=np.int64)
     logger.info(f"Embeddings: {X.shape}")
+    _log_class_balance(y)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=42
@@ -211,7 +221,8 @@ def train_yamnet_head(args):
     )
 
     head.fit(X_train, y_train, validation_data=(X_test, y_test),
-             epochs=args.epochs, batch_size=64)
+             epochs=args.epochs, batch_size=64,
+             class_weight=_class_weights(y_train))
 
     results = head.evaluate(X_test, y_test)
     logger.info(f"YAMNet head — loss: {results[0]:.4f}, acc: {results[1]:.4f}")
@@ -244,7 +255,7 @@ def evaluate(args):
         model = tf.keras.models.load_model(args.model)
         y_pred = np.argmax(model.predict(X), axis=1)
 
-    print(classification_report(y, y_pred, target_names=CATEGORIES))
+    print(classification_report(y, y_pred, **_REPORT_KWARGS))
     print("Confusion matrix:")
     print(confusion_matrix(y, y_pred))
 
@@ -253,12 +264,41 @@ def evaluate(args):
 # Helpers
 # ------------------------------------------------------------------
 
+# Report every category even when one is missing from the data
+_REPORT_KWARGS = dict(labels=list(range(len(CATEGORIES))),
+                      target_names=CATEGORIES, zero_division=0)
+
+MIN_SAMPLES_PER_CATEGORY = 100
+
+
+def _log_class_balance(y: np.ndarray):
+    counts = np.bincount(y, minlength=len(CATEGORIES))
+    logger.info("Samples per category: " + ", ".join(
+        f"{cat}={n}" for cat, n in zip(CATEGORIES, counts)))
+    for cat, n in zip(CATEGORIES, counts):
+        if n < MIN_SAMPLES_PER_CATEGORY:
+            logger.warning(
+                f"Only {n} '{cat}' samples — the model will be weak on this "
+                f"category. Add recordings with --extra-data DIR/{cat}/"
+            )
+
+
+def _class_weights(y: np.ndarray) -> dict:
+    """Balanced class weights for Keras fit(), keyed by class index."""
+    from sklearn.utils.class_weight import compute_class_weight
+    present = np.unique(y)
+    weights = compute_class_weight("balanced", classes=present, y=y)
+    return {int(c): float(w) for c, w in zip(present, weights)}
+
+
 def _make_iterators(args) -> list:
     iters = []
     if args.urbansound:
         iters.append(load_urbansound8k(args.urbansound))
     if args.esc50:
         iters.append(load_esc50(args.esc50))
+    if args.extra_data:
+        iters.append(load_folder(args.extra_data))
     if not iters:
         logger.warning("No dataset path provided; generating synthetic data")
         iters.append(_synthetic_iterator(n=500))
@@ -313,6 +353,9 @@ def main():
                         help="Path to UrbanSound8K directory")
     parser.add_argument("--esc50", type=str, default=None,
                         help="Path to ESC-50-master directory")
+    parser.add_argument("--extra-data", type=str, default=None,
+                        help="Directory with one sub-folder of clips per category "
+                             "(alarm/, speech/, music/, keyboard/, environment/)")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--model", type=str, default=None,
                         help="Model path (for --mode eval)")

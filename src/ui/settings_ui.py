@@ -71,6 +71,8 @@ class PriorityRow(tk.Frame):
 class SettingsWindow:
     """Main settings window."""
 
+    SAVE_DELAY_MS = 500   # slider drags are written to disk once they settle
+
     def __init__(self, priority_manager, engine=None):
         self._pm = priority_manager
         self._engine = engine
@@ -85,8 +87,10 @@ class SettingsWindow:
         self._volume_var = tk.StringVar(value="볼륨: --")
         self._detection_var = tk.StringVar(value="감지: --")
         self._running = False
+        self._save_job: Optional[str] = None
 
         self._build_ui()
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -129,16 +133,19 @@ class SettingsWindow:
         self._recv_var = tk.IntVar(value=settings.get("recovery_time_ms", 1500))
         self._thresh_var = tk.DoubleVar(value=settings.get("detection_threshold", 0.3))
 
-        self._add_slider_row(settings_frame, "기준 볼륨", self._base_vol_var,
-                             0.0, 1.5, self._on_base_vol_change, row=0)
+        self._add_slider_row(settings_frame, "기준 볼륨 (시작 시 대비)", self._base_vol_var,
+                             0.0, 1.5,
+                             lambda v: self._on_setting_change("base_volume", round(float(v), 2)),
+                             row=0)
         self._add_slider_row(settings_frame, "응답 속도 (ms)", self._resp_var,
-                             50, 1000, lambda v: self._pm.update_setting("response_time_ms", int(v)),
+                             50, 1000, lambda v: self._on_setting_change("response_time_ms", int(v)),
                              row=1)
         self._add_slider_row(settings_frame, "복구 시간 (ms)", self._recv_var,
-                             500, 5000, lambda v: self._pm.update_setting("recovery_time_ms", int(v)),
+                             500, 5000, lambda v: self._on_setting_change("recovery_time_ms", int(v)),
                              row=2)
         self._add_slider_row(settings_frame, "감지 임계값", self._thresh_var,
-                             0.1, 0.9, lambda v: self._pm.update_setting("detection_threshold", float(v)),
+                             0.1, 0.9,
+                             lambda v: self._on_setting_change("detection_threshold", round(float(v), 2)),
                              row=3)
 
         # ── Status Bar ───────────────────────────────────────────────
@@ -169,6 +176,9 @@ class SettingsWindow:
         ).pack(side=tk.LEFT, padx=6)
 
         tk.Label(root, textvariable=self._status_var,
+                 font=("Helvetica", 9), fg="#888888").pack(pady=(0, 2))
+        tk.Label(root,
+                 text="※ 스피커 사용 시 마이크가 재생 중인 소리를 다시 감지할 수 있어 헤드폰을 권장합니다",
                  font=("Helvetica", 9), fg="#888888").pack(pady=(0, 6))
 
     def _add_slider_row(self, parent, label, var, from_, to, command, row):
@@ -208,14 +218,28 @@ class SettingsWindow:
     # ------------------------------------------------------------------
 
     def _on_multiplier_change(self, category: str, value: float):
-        self._pm.set_volume_multiplier(category, round(value, 2))
+        # The engine reads multipliers from the manager on every chunk
+        self._pm.set_volume_multiplier(category, round(value, 2), save=False)
+        self._schedule_save()
         if category in self._rows:
             self._rows[category].update_value_label(value)
 
-    def _on_base_vol_change(self, value: float):
-        self._pm.update_setting("base_volume", round(float(value), 2))
+    def _on_setting_change(self, key: str, value):
+        self._pm.update_setting(key, value, save=False)
+        self._schedule_save()
         if self._engine:
-            self._engine.set_base_volume(float(value))
+            self._engine.update_settings(self._pm.get_settings())
+
+    def _schedule_save(self):
+        if self._save_job is not None:
+            self._root.after_cancel(self._save_job)
+        self._save_job = self._root.after(self.SAVE_DELAY_MS, self._flush_save)
+
+    def _flush_save(self):
+        if self._save_job is not None:
+            self._root.after_cancel(self._save_job)
+            self._save_job = None
+        self._pm.save()
 
     def _move_up(self, category: str):
         cats = self._pm.sorted_categories()
@@ -249,8 +273,26 @@ class SettingsWindow:
 
     def _reset_defaults(self):
         if messagebox.askyesno("확인", "우선순위를 기본값으로 되돌릴까요?"):
+            if self._save_job is not None:
+                self._root.after_cancel(self._save_job)
+                self._save_job = None
             self._pm.reset_to_defaults()
             self._rebuild_priority_list()
+
+            settings = self._pm.get_settings()
+            self._base_vol_var.set(settings.get("base_volume", 1.0))
+            self._resp_var.set(settings.get("response_time_ms", 200))
+            self._recv_var.set(settings.get("recovery_time_ms", 1500))
+            self._thresh_var.set(settings.get("detection_threshold", 0.3))
+            if self._engine:
+                self._engine.update_settings(settings)
+
+    def _on_close(self):
+        self._flush_save()
+        if self._engine and self._running:
+            self._engine.stop()
+            self._running = False
+        self._root.destroy()
 
     def _poll_status(self):
         if not self._running or not self._engine:
