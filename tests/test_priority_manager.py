@@ -83,3 +83,15 @@ class TestPriorityManager:
     def test_update_setting(self, tmp_config):
         tmp_config.update_setting("base_volume", 0.75)
         assert abs(tmp_config.get_settings()["base_volume"] - 0.75) < 1e-9
+
+    def test_deferred_save(self, tmp_path):
+        path = tmp_path / "p.json"
+        pm = PriorityManager(config_path=path)
+        pm.set_volume_multiplier("speech", 0.9, save=False)
+        pm.update_setting("base_volume", 0.6, save=False)
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["sound_categories"]["speech"]["volume_multiplier"] != 0.9
+        pm.save()
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["sound_categories"]["speech"]["volume_multiplier"] == 0.9
+        assert on_disk["settings"]["base_volume"] == 0.6

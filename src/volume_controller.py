@@ -6,8 +6,13 @@ Priority: Windows (pycaw) → PulseAudio (Linux) → ALSA amixer (Linux) → mac
 Volume changes are smoothed with an exponential moving average to avoid
 jarring sudden jumps, and a recovery timer gradually restores the volume
 to its baseline after the triggering sound subsides.
+
+All volume levels are relative to the system volume captured when the
+controller starts, so a base volume of 1.0 keeps the user's own setting and
+stopping the controller puts that setting back.
 """
 
+import shutil
 import subprocess
 import threading
 import time
@@ -77,6 +82,18 @@ class PulseAudioBackend(VolumeBackend):
 
 class ALSABackend(VolumeBackend):
     """ALSA volume control via amixer command."""
+
+    @staticmethod
+    def is_available() -> bool:
+        if shutil.which("amixer") is None:
+            return False
+        try:
+            out = subprocess.check_output(
+                ["amixer", "get", "Master"], text=True, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            return False
+        return "%" in out
 
     def get_volume(self) -> float:
         try:
@@ -164,12 +181,9 @@ def _create_backend() -> VolumeBackend:
     except Exception:
         pass
 
-    try:
-        ALSABackend().get_volume()
+    if ALSABackend.is_available():
         logger.info("Using ALSA backend")
         return ALSABackend()
-    except Exception:
-        pass
 
     logger.warning("No audio backend available; using stub")
     return StubBackend()
@@ -182,37 +196,81 @@ class VolumeController:
     Logic:
     1. Receive classification probabilities + priority config from PriorityManager.
     2. Compute target volume multiplier for the highest-priority detected sound.
-    3. Apply exponential smoothing toward target volume.
+    3. Apply exponential smoothing toward target volume; `response_time_ms` is
+       the time constant of that smoothing.
     4. Start a recovery timer: after `recovery_time_ms` of no high-priority
-       detections, gradually restore volume to `base_volume`.
+       detections, gradually restore volume to the baseline.
+
+    The baseline is `base_volume` × the system volume captured by start().
+    While a category holds the volume down, it keeps holding as long as it is
+    still detected above a lower release threshold. This hysteresis stops the
+    volume from pumping when the microphone hears the computer's own playback
+    more quietly after ducking.
     """
+
+    TICK_S = 0.05            # smoothing loop interval
+    RELEASE_RATIO = 0.6      # release threshold = detection threshold × ratio
 
     def __init__(
         self,
         base_volume: float = 1.0,
         response_time_ms: int = 200,
         recovery_time_ms: int = 1500,
-        smoothing_alpha: float = 0.3,
+        detection_threshold: float = 0.3,
+        smoothing_alpha: Optional[float] = None,
+        backend: Optional[VolumeBackend] = None,
     ):
-        self._backend = _create_backend()
+        self._backend = backend or _create_backend()
         self._base_volume = base_volume
-        self._response_ms = response_time_ms
+        self._threshold = detection_threshold
+        self._fixed_alpha = smoothing_alpha
+        self._alpha = 0.0
         self._recovery_ms = recovery_time_ms
-        self._alpha = smoothing_alpha
+        self.set_timing(response_time_ms, recovery_time_ms)
 
         self._current_volume = self._backend.get_volume()
+        self._reference_volume = self._current_volume
         self._target_volume = self._current_volume
         self._last_trigger_time: Optional[float] = None
         self._recovery_active = False
+        self._held_category: Optional[str] = None
 
         self._lock = threading.Lock()
-        self._worker = threading.Thread(target=self._smooth_loop, daemon=True)
-        self._running = True
-        self._worker.start()
+        self._running = False
+        self._worker: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def start(self):
+        """Capture the current system volume as reference and start smoothing."""
+        if self._running:
+            return
+        reference = self._backend.get_volume()
+        with self._lock:
+            self._reference_volume = reference
+            self._current_volume = reference
+            self._target_volume = self._baseline()
+            self._last_trigger_time = None
+            self._recovery_active = False
+            self._held_category = None
+        self._running = True
+        self._worker = threading.Thread(target=self._smooth_loop, daemon=True)
+        self._worker.start()
+
+    def stop(self):
+        """Stop smoothing and put the system volume back where start() found it."""
+        if not self._running:
+            return
+        self._running = False
+        if self._worker:
+            self._worker.join(timeout=2.0)
+        try:
+            self._backend.set_volume(self._reference_volume)
+            self._current_volume = self._reference_volume
+        except Exception as e:
+            logger.error(f"Volume restore error: {e}")
 
     def apply_priority(self, probs: dict, priority_config: dict):
         """
@@ -221,12 +279,22 @@ class VolumeController:
 
         priority_config: dict of category -> {priority, volume_multiplier}
         """
-        # Find the highest-priority category that exceeds threshold
-        threshold = 0.25
+        with self._lock:
+            threshold = self._threshold
+            held = self._held_category
         active = {cat: p for cat, p in probs.items() if p >= threshold}
 
         if not active:
-            return  # nothing significant detected
+            # Keep holding while the triggering sound is still the dominant,
+            # if fainter, sound (a flat/silent result releases the hold)
+            held_p = probs.get(held, 0.0)
+            others = [p for cat, p in probs.items() if cat != held]
+            if (held is not None and held_p >= threshold * self.RELEASE_RATIO
+                    and held_p > max(others, default=0.0)):
+                with self._lock:
+                    if self._held_category == held:
+                        self._last_trigger_time = time.monotonic()
+            return
 
         # Sort by user-defined priority (lower number = higher priority)
         def sort_key(cat):
@@ -236,12 +304,13 @@ class VolumeController:
         top_cat = min(active, key=sort_key)
         cfg = priority_config.get(top_cat, {})
         multiplier = cfg.get("volume_multiplier", 1.0)
-        target = self._base_volume * multiplier
 
         with self._lock:
+            target = self._baseline() * multiplier
             self._target_volume = target
             self._last_trigger_time = time.monotonic()
             self._recovery_active = False
+            self._held_category = top_cat
 
         logger.info(
             f"Volume target → {target:.2f} "
@@ -251,37 +320,49 @@ class VolumeController:
     def set_base_volume(self, volume: float):
         with self._lock:
             self._base_volume = max(0.0, min(1.5, volume))
+            if self._held_category is None:
+                self._target_volume = self._baseline()
+
+    def set_detection_threshold(self, threshold: float):
+        with self._lock:
+            self._threshold = threshold
+
+    def set_timing(self, response_time_ms: int, recovery_time_ms: int):
+        """Update smoothing speed and recovery delay (takes effect immediately)."""
+        if self._fixed_alpha is not None:
+            alpha = self._fixed_alpha
+        else:
+            # EMA reaching ~63% of the way to target within response_time_ms
+            alpha = 1.0 - math.exp(-self.TICK_S * 1000 / max(1, response_time_ms))
+        self._alpha = alpha
+        self._recovery_ms = recovery_time_ms
 
     def get_current_volume(self) -> float:
         return self._current_volume
-
-    def stop(self):
-        self._running = False
-        self._worker.join(timeout=2.0)
 
     # ------------------------------------------------------------------
     # Internal smoothing loop
     # ------------------------------------------------------------------
 
+    def _baseline(self) -> float:
+        """Volume to rest at when nothing is detected. Caller holds the lock."""
+        return self._reference_volume * self._base_volume
+
     def _smooth_loop(self):
-        interval = 0.05  # 50 ms update tick
-
         while self._running:
-            time.sleep(interval)
-
-            with self._lock:
-                target = self._target_volume
-                last_trigger = self._last_trigger_time
+            time.sleep(self.TICK_S)
 
             # Check recovery: if enough time passed since last trigger, ramp back
             now = time.monotonic()
-            if last_trigger is not None:
-                elapsed_ms = (now - last_trigger) * 1000
-                if elapsed_ms > self._recovery_ms and not self._recovery_active:
-                    with self._lock:
-                        self._target_volume = self._base_volume
-                        self._recovery_active = True
+            with self._lock:
+                last_trigger = self._last_trigger_time
+                if (last_trigger is not None and not self._recovery_active
+                        and (now - last_trigger) * 1000 > self._recovery_ms):
+                    self._target_volume = self._baseline()
+                    self._recovery_active = True
+                    self._held_category = None
                     logger.debug("Volume recovery: restoring base volume")
+                target = self._target_volume
 
             # Exponential moving average toward target
             new_vol = self._alpha * target + (1.0 - self._alpha) * self._current_volume

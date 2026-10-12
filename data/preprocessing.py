@@ -4,7 +4,7 @@ Audio preprocessing utilities for dataset preparation and feature extraction.
 Supports:
   - Loading audio files (WAV, MP3, FLAC) with resampling
   - MFCC + mel-spectrogram feature extraction
-  - Dataset loading from UrbanSound8K, ESC-50, and AudioSet CSV manifests
+  - Dataset loading from UrbanSound8K, ESC-50, and plain per-category folders
   - Train/validation split with stratification
   - Augmentation: time-stretch, pitch-shift, additive noise
 """
@@ -79,13 +79,10 @@ ESC50_MAP = {
     "pouring_water": "environment",
     "toilet_flush": "environment",
     "thunderstorm": "environment",
-    "crying_baby2": "speech",
-    "sneezing2": "speech",
-    "clapping2": "environment",
     "helicopter": "environment",
     "chainsaw": "environment",
-    "siren2": "alarm",
-    "car_horn2": "alarm",
+    "siren": "alarm",
+    "car_horn": "alarm",
     "engine": "environment",
     "train": "environment",
     "church_bells": "alarm",
@@ -95,6 +92,8 @@ ESC50_MAP = {
 }
 
 CATEGORIES = ["alarm", "speech", "music", "keyboard", "environment"]
+
+AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg"}
 
 
 # ------------------------------------------------------------------
@@ -201,7 +200,7 @@ def load_urbansound8k(root: str) -> Iterator[tuple[np.ndarray, str]]:
     root: path to the UrbanSound8K directory (contains metadata/ and audio/).
     """
     meta_path = Path(root) / "metadata" / "UrbanSound8K.csv"
-    with open(meta_path) as f:
+    with open(meta_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             class_name = row["class"].lower()
@@ -227,7 +226,7 @@ def load_esc50(root: str) -> Iterator[tuple[np.ndarray, str]]:
     root: path to the ESC-50-master directory.
     """
     meta_path = Path(root) / "meta" / "esc50.csv"
-    with open(meta_path) as f:
+    with open(meta_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             class_name = row["category"].lower()
@@ -236,6 +235,30 @@ def load_esc50(root: str) -> Iterator[tuple[np.ndarray, str]]:
                 continue
             fpath = Path(root) / "audio" / row["filename"]
             if not fpath.exists():
+                continue
+            try:
+                audio = load_audio(str(fpath), duration=CLIP_DURATION)
+                audio = clip_or_pad(audio)
+                yield audio, category
+            except Exception as e:
+                logger.warning(f"Skipping {fpath}: {e}")
+
+
+def load_folder(root: str) -> Iterator[tuple[np.ndarray, str]]:
+    """
+    Yield (audio, category) pairs from a directory with one sub-folder per
+    category, e.g. root/speech/*.wav, root/music/*.mp3.
+
+    Use this to add real speech and music recordings (LibriSpeech, GTZAN,
+    your own clips, ...) — UrbanSound8K/ESC-50 contain almost none.
+    """
+    root_path = Path(root)
+    for category in CATEGORIES:
+        cat_dir = root_path / category
+        if not cat_dir.is_dir():
+            continue
+        for fpath in sorted(cat_dir.rglob("*")):
+            if fpath.suffix.lower() not in AUDIO_EXTENSIONS:
                 continue
             try:
                 audio = load_audio(str(fpath), duration=CLIP_DURATION)

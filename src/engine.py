@@ -27,6 +27,8 @@ class AudioControlEngine:
       - AudioCapture runs its own daemon thread for microphone I/O.
       - Each audio chunk is dispatched to the classifier inline in that thread.
       - VolumeController runs its own 50 ms smoothing loop thread.
+
+    start()/stop() can be called repeatedly (e.g. the UI start/stop button).
     """
 
     def __init__(
@@ -36,7 +38,7 @@ class AudioControlEngine:
         chunk_ms: int = 500,
         overlap_ms: int = 100,
         mic_device: Optional[int] = None,
-        mfcc_model_path: Optional[str] = None,
+        model_path: Optional[str] = None,
         use_yamnet: bool = True,
     ):
         self._pm = priority_manager
@@ -45,7 +47,7 @@ class AudioControlEngine:
         self._classifier = AudioClassifier(
             smoothing_window=settings.get("smoothing_window", 5),
             detection_threshold=settings.get("detection_threshold", 0.3),
-            mfcc_model_path=mfcc_model_path,
+            model_path=model_path,
             use_yamnet=use_yamnet,
         )
 
@@ -53,6 +55,7 @@ class AudioControlEngine:
             base_volume=settings.get("base_volume", 1.0),
             response_time_ms=settings.get("response_time_ms", 200),
             recovery_time_ms=settings.get("recovery_time_ms", 1500),
+            detection_threshold=settings.get("detection_threshold", 0.3),
         )
 
         self._capture = AudioCapture(
@@ -77,6 +80,7 @@ class AudioControlEngine:
         if self._running:
             return
         self._running = True
+        self._volume_ctrl.start()
         self._capture.start()
         logger.info("AudioControlEngine started")
 
@@ -97,8 +101,16 @@ class AudioControlEngine:
                 "probabilities": dict(self._last_probs),
             }
 
-    def set_base_volume(self, volume: float):
-        self._volume_ctrl.set_base_volume(volume)
+    def update_settings(self, settings: dict):
+        """Apply changed general settings to the running pipeline."""
+        threshold = settings.get("detection_threshold", 0.3)
+        self._classifier.set_threshold(threshold)
+        self._volume_ctrl.set_detection_threshold(threshold)
+        self._volume_ctrl.set_base_volume(settings.get("base_volume", 1.0))
+        self._volume_ctrl.set_timing(
+            settings.get("response_time_ms", 200),
+            settings.get("recovery_time_ms", 1500),
+        )
 
     # ------------------------------------------------------------------
     # Audio pipeline
@@ -108,12 +120,14 @@ class AudioControlEngine:
         """Called from the AudioCapture thread for each new chunk."""
         probs = self._classifier.classify(audio, sample_rate)
 
+        # Always forwarded: below-threshold results still let the controller
+        # hold or release an active duck.
+        self._volume_ctrl.apply_priority(probs, self._pm.get_priority_config())
+
         if not self._classifier.is_significant(probs):
             return
 
         top_cat, confidence = self._classifier.top_category(probs)
-        priority_config = self._pm.get_priority_config()
-        self._volume_ctrl.apply_priority(probs, priority_config)
 
         with self._lock:
             self._last_probs = probs

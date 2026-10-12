@@ -145,3 +145,101 @@ class TestAudioClassifier:
         assert "경보" in AudioClassifier.category_display_name("alarm")
         assert "음악" in AudioClassifier.category_display_name("music")
         assert "말소리" in AudioClassifier.category_display_name("speech")
+
+
+# ------------------------------------------------------------------
+# YAMNet category mapping
+# ------------------------------------------------------------------
+
+from unittest.mock import patch
+from src.audio_classifier import (
+    YAMNetClassifier, CNNClassifier, build_category_indices, aggregate_scores,
+    YAMNET_CATEGORY_CLASSES, YAMNET_MUSIC_RANGE,
+)
+
+
+def _fake_class_names():
+    names = [n for cat in CATEGORIES for n in YAMNET_CATEGORY_CLASSES[cat]]
+    first, last = YAMNET_MUSIC_RANGE
+    return ["Silence"] + names + [first, "Guitar", "Piano", last]
+
+
+class TestYAMNetMapping:
+    def test_indices_resolved_by_name(self):
+        names = _fake_class_names()
+        idx = build_category_indices(names)
+        assert names.index("Typing") in idx["keyboard"]
+        assert names.index("Siren") in idx["alarm"]
+        assert names.index("Speech") in idx["speech"]
+        assert names.index("Guitar") in idx["music"]   # inside music range
+        assert names.index("Silence") not in sum(idx.values(), [])
+
+    def test_aggregate_picks_dominant_category(self):
+        names = _fake_class_names()
+        idx = build_category_indices(names)
+        scores = np.full(len(names), 0.01)
+        scores[names.index("Speech")] = 0.9
+        probs = aggregate_scores(scores, idx)
+        assert max(probs, key=probs.get) == "speech"
+        assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+    def test_aggregate_low_scores_not_significant(self):
+        names = _fake_class_names()
+        idx = build_category_indices(names)
+        probs = aggregate_scores(np.full(len(names), 0.01), idx)
+        assert all(abs(p - 0.2) < 1e-9 for p in probs.values())
+
+
+# ------------------------------------------------------------------
+# Trained models
+# ------------------------------------------------------------------
+
+class _PartialModel:
+    """sklearn-like model trained without 'speech' (index 1) samples."""
+    classes_ = np.array([0, 2, 3, 4])
+
+    def predict_proba(self, X):
+        return np.array([[0.1, 0.6, 0.2, 0.1]])
+
+
+class TestTrainedModels:
+    def test_pkl_classes_aligned_to_categories(self):
+        clf = MFCCClassifier(smoothing_window=1)
+        clf._model = _PartialModel()
+        probs = clf.classify(_sine(440), SR)
+        assert probs["speech"] == 0.0
+        assert abs(probs["music"] - 0.6) < 1e-9
+
+    def test_explicit_pkl_model_skips_yamnet(self, tmp_path):
+        with patch("src.audio_classifier.YAMNetClassifier") as yamnet:
+            AudioClassifier(model_path=str(tmp_path / "m.pkl"), use_yamnet=True)
+        yamnet.assert_not_called()
+
+    def test_keras_cnn_model_is_used(self, tmp_path):
+        tf = pytest.importorskip("tensorflow")
+        inputs = tf.keras.Input(shape=(64, 32, 1))
+        x = tf.keras.layers.GlobalAveragePooling2D()(inputs)
+        outputs = tf.keras.layers.Dense(len(CATEGORIES), activation="softmax")(x)
+        path = tmp_path / "cnn.keras"
+        tf.keras.Model(inputs, outputs).save(str(path))
+
+        clf = AudioClassifier(smoothing_window=1, model_path=str(path),
+                              use_yamnet=False)
+        assert isinstance(clf._primary, CNNClassifier)
+        probs = clf.classify(_sine(440)[: SR // 2], SR)   # 0.5 s chunk
+        assert set(probs) == set(CATEGORIES)
+        assert abs(sum(probs.values()) - 1.0) < 1e-5
+
+    def test_yamnet_head_used_for_embeddings(self):
+        tf = pytest.importorskip("tensorflow")
+        head = tf.keras.Sequential([
+            tf.keras.Input(shape=(1024,)),
+            tf.keras.layers.Dense(len(CATEGORIES), activation="softmax"),
+        ])
+        with patch.object(YAMNetClassifier, "_load_model", lambda self: None):
+            clf = YAMNetClassifier(smoothing_window=1, head=head)
+        clf._model = lambda audio: (tf.zeros((2, 521)), tf.ones((2, 1024)), None)
+        clf._loaded = True
+        probs = clf.classify(_sine(440), SR)
+        assert set(probs) == set(CATEGORIES)
+        assert abs(sum(probs.values()) - 1.0) < 1e-5

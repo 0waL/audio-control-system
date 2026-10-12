@@ -55,15 +55,17 @@ class PriorityManager:
         if category not in self._config["sound_categories"]:
             raise ValueError(f"Unknown category: {category}")
         self._config["sound_categories"][category]["priority"] = priority
-        self._save()
+        self.save()
 
-    def set_volume_multiplier(self, category: str, multiplier: float):
+    def set_volume_multiplier(self, category: str, multiplier: float,
+                              save: bool = True):
         if category not in self._config["sound_categories"]:
             raise ValueError(f"Unknown category: {category}")
         if not 0.0 <= multiplier <= 1.5:
             raise ValueError("multiplier must be in [0.0, 1.5]")
         self._config["sound_categories"][category]["volume_multiplier"] = multiplier
-        self._save()
+        if save:
+            self.save()
 
     def swap_priorities(self, cat_a: str, cat_b: str):
         cats = self._config["sound_categories"]
@@ -71,15 +73,16 @@ class PriorityManager:
         pb = cats[cat_b]["priority"]
         cats[cat_a]["priority"] = pb
         cats[cat_b]["priority"] = pa
-        self._save()
+        self.save()
 
-    def update_setting(self, key: str, value):
+    def update_setting(self, key: str, value, save: bool = True):
         self._config["settings"][key] = value
-        self._save()
+        if save:
+            self.save()
 
     def reset_to_defaults(self):
         self._config = self._load_defaults()
-        self._save()
+        self.save()
 
     def sorted_categories(self) -> list[tuple[str, dict]]:
         """Return categories sorted by priority (ascending = highest first)."""
@@ -101,14 +104,15 @@ class PriorityManager:
                 logger.warning(f"Corrupt user config ({e}), using defaults")
 
         self._config = self._load_defaults()
-        self._save()
+        self.save()
 
     @staticmethod
     def _load_defaults() -> dict:
         with open(DEFAULT_CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f)
 
-    def _save(self):
+    def save(self):
+        """Write the config to disk (setters with save=False defer this)."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._path, "w", encoding="utf-8") as f:
             json.dump(self._config, f, ensure_ascii=False, indent=2)
