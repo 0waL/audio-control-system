@@ -13,7 +13,9 @@ UrbanSound8K class name (siren/, dog_bark/, ...).
 Usage:
   python training/evaluate_yamnet.py data.zip
   python training/evaluate_yamnet.py data_dir/ --output results/yamnet_eval.md
-  python training/evaluate_yamnet.py data.zip --yamnet-model /path/to/yamnet_savedmodel
+  python training/evaluate_yamnet.py data.zip --yamnet-model models/yamnet
+
+If tfhub.dev is unreachable, build models/yamnet with training/export_yamnet.py.
 """
 
 import argparse
@@ -142,7 +144,7 @@ def report(r: dict, dataset: str, model: str) -> str:
         f"- 측정일: {datetime.date.today().isoformat()}",
         f"- 데이터: `{dataset}` — 파일 {len(r['y_true'])}개, 1초 구간 {len(r['w_true'])}개"
         + (f" (라벨 없음/읽기 실패로 제외 {len(r['skipped'])}개)" if r["skipped"] else ""),
-        f"- 모델: YAMNet (`{model}`), 입력 {YAMNET_INPUT_SECONDS:g}초, 클래스 이름 기반 카테고리 매핑",
+        f"- 모델: YAMNet ({model}), 입력 {YAMNET_INPUT_SECONDS:g}초, 클래스 이름 기반 카테고리 매핑",
         "- 파일 예측: 1초 구간별 확률 평균의 최댓값",
         "",
         "## 요약",
@@ -195,7 +197,10 @@ def main():
             root = data
         results = evaluate(root, clf)
 
-    text = report(results, data.name, args.yamnet_model)
+    model = args.yamnet_model
+    if not model.startswith(("http://", "https://")):
+        model = f"로컬 SavedModel {Path(model).name} — 공식 yamnet.h5 가중치"
+    text = report(results, data.name, model)
     print(text)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
