@@ -53,3 +53,25 @@ def test_evaluate_and_report(tmp_path):
 
     text = report(r, "test", "fake")
     assert "| 파일 단위 정확도 | 33.3% |" in text
+
+
+def test_zip_is_read_member_by_member(tmp_path):
+    import zipfile
+    import soundfile as sf
+    sf.write(tmp_path / "a.wav", np.random.randn(SR).astype(np.float32) * 0.1, SR)
+    archive = tmp_path / "data.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(tmp_path / "a.wav", "set/speech/a.wav")
+        zf.write(tmp_path / "a.wav", "set/music/b.wav")
+        zf.writestr("set/readme.txt", "not audio")
+
+    r = evaluate(archive, _FakeClassifier())
+    assert sorted(r["y_true"]) == ["music", "speech"]
+    assert r["skipped"] == []
+
+
+def test_korean_zip_names_decoded():
+    import zipfile
+    from training.evaluate_yamnet import _member_name
+    info = zipfile.ZipInfo("말소리/a.wav".encode("cp949").decode("cp437"))
+    assert _member_name(info) == "말소리/a.wav"

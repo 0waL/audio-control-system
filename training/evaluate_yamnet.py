@@ -21,6 +21,7 @@ If tfhub.dev is unreachable, build models/yamnet with training/export_yamnet.py.
 import argparse
 import datetime
 import logging
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -46,6 +47,7 @@ DETECTION_THRESHOLD = 0.3          # config/default_priorities.json default
 MIN_LAST_WINDOW_SECONDS = 0.5      # shorter trailing remainders are dropped
 
 LABEL_ALIASES = {**URBANSOUND_MAP, **ESC50_MAP, **{c: c for c in CATEGORIES}}
+MAX_LISTED_MISTAKES = 100
 
 
 def label_for(rel_path: Path):
@@ -75,14 +77,49 @@ def predict(probs: dict) -> str:
     return max(probs, key=probs.get)
 
 
-def evaluate(root: Path, clf: YAMNetClassifier) -> dict:
-    files = sorted(p for p in root.rglob("*")
-                   if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+def _member_name(info: zipfile.ZipInfo) -> str:
+    """Zip member name; names written without the UTF-8 flag (e.g. by Windows
+    Explorer) are usually cp949 on Korean systems, not cp437."""
+    if info.flag_bits & 0x800:
+        return info.filename
+    try:
+        return info.filename.encode("cp437").decode("cp949")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return info.filename
+
+
+def audio_files(data: Path):
+    """
+    Return (count, iterator of (relative path, local file)) for every audio
+    file in a directory or zip. Zip members are extracted one at a time to a
+    temporary file, so a large archive never has to be unpacked in full.
+    """
+    if data.suffix.lower() != ".zip":
+        files = sorted(p for p in data.rglob("*")
+                       if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+        return len(files), ((p.relative_to(data), p) for p in files)
+
+    with zipfile.ZipFile(data) as zf:
+        members = [(Path(_member_name(i)), i) for i in zf.infolist()
+                   if not i.is_dir() and Path(i.filename).suffix.lower() in AUDIO_EXTENSIONS]
+
+    def extract_each():
+        with zipfile.ZipFile(data) as zf, tempfile.TemporaryDirectory() as tmp:
+            for rel, info in sorted(members, key=lambda m: str(m[0])):
+                local = Path(tmp) / f"clip{rel.suffix.lower()}"
+                with zf.open(info) as src, open(local, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                yield rel, local
+
+    return len(members), extract_each()
+
+
+def evaluate(data: Path, clf: YAMNetClassifier) -> dict:
+    total, files = audio_files(data)
     y_true, y_pred, w_true, w_pred = [], [], [], []
     skipped, detected, mistakes = [], 0, []
 
-    for i, path in enumerate(files, 1):
-        rel = path.relative_to(root)
+    for i, (rel, path) in enumerate(files, 1):
         label = label_for(rel)
         if label is None:
             skipped.append(str(rel))
@@ -111,7 +148,7 @@ def evaluate(root: Path, clf: YAMNetClassifier) -> dict:
         if pred != label:
             mistakes.append((str(rel), label, pred))
         if i % 50 == 0:
-            logger.info(f"{i}/{len(files)} files")
+            logger.info(f"{i}/{total} files")
 
     return dict(y_true=y_true, y_pred=y_pred, w_true=w_true, w_pred=w_pred,
                 skipped=skipped, detected=detected, mistakes=mistakes)
@@ -169,8 +206,10 @@ def report(r: dict, dataset: str, model: str) -> str:
                [[c] + [int(v) for v in row] for c, row in zip(present, cm)]),
     ]
     if r["mistakes"]:
-        out += ["", f"## 틀린 파일 ({len(r['mistakes'])}개)", "",
-                _table(["파일", "정답", "예측"], r["mistakes"])]
+        listed = r["mistakes"][:MAX_LISTED_MISTAKES]
+        out += ["", f"## 틀린 파일 ({len(r['mistakes'])}개"
+                + (f", 앞의 {len(listed)}개만 표시" if len(listed) < len(r["mistakes"]) else "")
+                + ")", "", _table(["파일", "정답", "예측"], listed)]
     return "\n".join(out) + "\n"
 
 
@@ -188,14 +227,7 @@ def main():
         raise SystemExit(f"Could not load YAMNet from {args.yamnet_model}")
 
     data = Path(args.data)
-    with tempfile.TemporaryDirectory() as tmp:
-        if data.suffix.lower() == ".zip":
-            with zipfile.ZipFile(data) as zf:
-                zf.extractall(tmp)
-            root = Path(tmp)
-        else:
-            root = data
-        results = evaluate(root, clf)
+    results = evaluate(data, clf)
 
     model = args.yamnet_model
     if not model.startswith(("http://", "https://")):
