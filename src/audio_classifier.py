@@ -27,6 +27,8 @@ CATEGORY_DISPLAY = {
 }
 
 YAMNET_SAMPLE_RATE = 16000
+YAMNET_INPUT_SECONDS = 1.0     # every chunk is fitted to this length
+YAMNET_HUB_URL = "https://tfhub.dev/google/yamnet/1"
 
 # YAMNet (AudioSet) display names mapped to our 5 categories. Indices are
 # resolved at runtime from the class map shipped with the model.
@@ -105,6 +107,13 @@ def aggregate_scores(scores: np.ndarray, category_indices: dict) -> dict:
     return {cat: raw[cat] / total for cat in CATEGORIES}
 
 
+def _fit_length(audio: np.ndarray, n: int) -> np.ndarray:
+    """Keep the most recent n samples, or zero-pad up to n."""
+    if len(audio) >= n:
+        return audio[-n:]
+    return np.pad(audio, (0, n - len(audio)))
+
+
 def _resample(audio: np.ndarray, sample_rate: int, target_sr: int) -> np.ndarray:
     if sample_rate == target_sr:
         return audio
@@ -129,10 +138,15 @@ class YAMNetClassifier:
     YAMNet-based classifier. Without a head, class scores are mapped to our
     categories by name; with a trained head (Keras model on 1024-d mean
     embeddings), the head's softmax output is used directly.
+
+    Each chunk is fitted to YAMNET_INPUT_SECONDS of 16 kHz audio. `model_handle`
+    is the TF Hub URL or a local path of a downloaded YAMNet SavedModel.
     """
 
-    def __init__(self, smoothing_window: int = 5, head=None):
+    def __init__(self, smoothing_window: int = 5, head=None,
+                 model_handle: str = YAMNET_HUB_URL):
         self._model = None
+        self._model_handle = model_handle
         self._head = head
         self._category_indices: dict = {}
         self._loaded = False
@@ -142,7 +156,7 @@ class YAMNetClassifier:
     def _load_model(self):
         try:
             import tensorflow_hub as hub
-            self._model = hub.load("https://tfhub.dev/google/yamnet/1")
+            self._model = hub.load(self._model_handle)
             # Resolve class names from the model asset
             class_map_path = self._model.class_map_path().numpy().decode()
             import csv
@@ -162,7 +176,8 @@ class YAMNetClassifier:
     def classify(self, audio: np.ndarray, sample_rate: int = YAMNET_SAMPLE_RATE) -> Optional[dict]:
         """
         Returns normalized probability dict over CATEGORIES.
-        audio: float32 mono array; resampled to 16 kHz if needed.
+        audio: float32 mono array; resampled to 16 kHz and fitted to
+        YAMNET_INPUT_SECONDS.
         """
         if not self._loaded:
             return None
@@ -170,6 +185,7 @@ class YAMNetClassifier:
         try:
             import tensorflow as tf
             audio = _resample(audio, sample_rate, YAMNET_SAMPLE_RATE)
+            audio = _fit_length(audio, int(YAMNET_SAMPLE_RATE * YAMNET_INPUT_SECONDS))
             # scores: (frames, 521), embeddings: (frames, 1024)
             scores, embeddings, _ = self._model(tf.constant(audio.astype(np.float32)))
             if self._head is not None:
