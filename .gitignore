@@ -17,3 +17,6 @@ models/yamnet/
 .pytest_cache/
 *.log
 ~/.audio-control/
+
+# Local UrbanSound8K evaluation archive (too large for GitHub)
+archive (1).zip
